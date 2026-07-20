@@ -20,8 +20,8 @@ and a **macOS menu bar app** (`orca_menubar.py`) — use either or both.
 - Urgency order: **stopped → needs-input → working → done → idle**.
 - **Bottom-right = status key**: big count of agents needing you (or "all clear"),
   `page x/y`, press to cycle pages.
-- Deck **pulses bright** when something needs you; a macOS notification fires on
-  the transition into "needs you".
+- Deck **pulses bright** when something needs you. (Orca sends its own
+  notifications, so this doesn't add duplicate alerts.)
 - **Tap** a tile → focus that agent's terminal in Orca (raises the app).
 - **Hold** a tile (≥0.7s) → interrupt that agent (Esc/Ctrl-C to its terminal).
   Interrupting is always safe; there is deliberately **no blind "approve"** key —
