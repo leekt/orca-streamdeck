@@ -20,13 +20,9 @@ import colorsys
 import functools
 import hashlib
 import json
-import os
-import re
 import subprocess
 import threading
 import time
-import urllib.error
-import urllib.request
 
 from PIL import Image, ImageDraw, ImageFont
 from StreamDeck.DeviceManager import DeviceManager
@@ -43,11 +39,10 @@ GROUP_ACCENT = False        # draw a per-group color stripe down the left of eac
 GROUP_FILTER = None         # a repo displayName; show only agents in THAT repo's group
 GROUP_PAGES = False         # one group per page instead of urgency-flat pagination
 
-# --- Per-project icons: auto-get Orca's repoIcon (a GitHub owner avatar) when it
-# has one, else auto-generate a monogram. Downloads are cached under ~/.cache. ---
+# --- Per-project icons: an auto-generated identicon derived from the repo name,
+# distinct per project (no network, no external avatars). ---
 SHOW_ICONS = True
-ICON_CACHE_DIR = os.path.expanduser("~/.cache/orca-streamdeck/icons")
-_ICON_CACHE = {}            # cache key -> base PIL.Image (RGBA), or None
+_ICON_CACHE = {}            # repo name -> base identicon PIL.Image (RGBA)
 
 
 def group_color(group_id):
@@ -60,53 +55,32 @@ def group_color(group_id):
     return (round(r * 255), round(g * 255), round(b * 255))
 
 
-def _download_icon(url):
-    """Fetch an icon URL to a disk cache; return the local path, or None on failure."""
-    os.makedirs(ICON_CACHE_DIR, exist_ok=True)
-    path = os.path.join(ICON_CACHE_DIR, hashlib.md5(url.encode()).hexdigest() + ".img")
-    if not os.path.exists(path):
-        try:
-            with urllib.request.urlopen(url, timeout=10) as r, open(path, "wb") as f:
-                f.write(r.read())
-        except (urllib.error.URLError, OSError, ValueError):
-            return None
-    return path
-
-
-def _monogram(name, color):
-    """Generated fallback icon: 1–2 initials on a group-colored disc."""
-    s = 128
-    im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+def _identicon(name, size):
+    """Deterministic GitHub-style identicon from a repo name: a 5x5, vertically
+    mirrored block pattern colored by the name hash. Transparent background so the
+    tile's state color shows between blocks."""
+    h = hashlib.md5((name or "?").encode()).digest()
+    r, g, b = colorsys.hsv_to_rgb(h[-1] / 255, 0.6, 0.9)
+    fg = (round(r * 255), round(g * 255), round(b * 255), 255)
+    im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
-    d.ellipse([2, 2, s - 2, s - 2], fill=color + (255,))
-    parts = [p for p in re.split(r"[-_ ]+", name) if p]
-    letters = ("".join(p[0] for p in parts[:2]) or name[:2]).upper()
-    d.text((s // 2, s // 2), letters, font=load_font(round(s * 0.42)),
-           anchor="mm", fill=text_color(color))
+    pad = size * 0.12
+    cell = (size - 2 * pad) / 5
+    for i in range(15):                # 3 cols x 5 rows, mirrored into 5 cols
+        if h[i] & 1:
+            col, row = i // 5, i % 5
+            for c in (col, 4 - col):
+                x, y = pad + c * cell, pad + row * cell
+                d.rectangle([x, y, x + cell, y + cell], fill=fg)
     return im
 
 
 def icon_image(item, size):
-    """Sized RGBA icon for a tile: Orca's repoIcon if present, else a monogram.
-    Base images are cached in memory (and on disk for downloads)."""
-    ic = item.get("icon") or {}
-    if ic.get("type") == "image" and ic.get("src"):
-        key = ic["src"]
-    else:
-        key = f"mono:{item.get('repo')}:{item.get('group')}"
-    if key not in _ICON_CACHE:
-        base = None
-        if key.startswith("http"):
-            p = _download_icon(key)
-            if p:
-                try:
-                    base = Image.open(p).convert("RGBA")
-                except OSError:
-                    base = None
-        if base is None:
-            base = _monogram(item.get("repo", "?"), group_color(item.get("group")))
-        _ICON_CACHE[key] = base
-    return _ICON_CACHE[key].resize((size, size))
+    """Sized identicon for a tile, cached by repo name."""
+    name = item.get("repo", "?")
+    if name not in _ICON_CACHE:
+        _ICON_CACHE[name] = _identicon(name, 128)
+    return _ICON_CACHE[name].resize((size, size))
 
 # Urgency ranking (lower sorts to the front) + color legend, aligned to the
 # OpenAI Codex Micro convention: red=stopped/error, amber=needs input,
@@ -154,12 +128,11 @@ def _orca_json(args):
         return None
 
 
-def build_items(worktrees, terminals, repo_groups=None, repo_icons=None):
+def build_items(worktrees, terminals, repo_groups=None):
     """Flat, urgency-sorted list of agent tiles. Pure — no I/O, so it's testable.
-    Each item: {id, repo, sub, state, handle, worktree_id, group, icon}.
-    repo_groups maps repoId -> projectGroupId; repo_icons maps repoId -> repoIcon."""
+    Each item: {id, repo, sub, state, handle, worktree_id, group}.
+    repo_groups maps repoId -> projectGroupId (None -> group left unset)."""
     repo_groups = repo_groups or {}
-    repo_icons = repo_icons or {}
     # agent paneKey ("{tabId}:{leafId}") -> terminal handle
     by_pane = {f"{t.get('tabId')}:{t.get('leafId')}": t.get("handle") for t in terminals}
     # worktreeId -> handle of its most recently active terminal (fallback focus)
@@ -174,7 +147,6 @@ def build_items(worktrees, terminals, repo_groups=None, repo_icons=None):
         wid, repo = w["worktreeId"], w.get("repo", "?")
         branch = w.get("displayName") or ""
         group = repo_groups.get(w.get("repoId"))
-        icon = repo_icons.get(w.get("repoId"))
         agents = w.get("agents") or []
         if agents:
             for a in agents:
@@ -188,25 +160,23 @@ def build_items(worktrees, terminals, repo_groups=None, repo_icons=None):
                     "handle": handle,
                     "worktree_id": wid,
                     "group": group,
-                    "icon": icon,
                 })
         else:  # worktree with no agent session — show it at worktree level
             items.append({
                 "id": wid, "repo": repo, "sub": branch, "state": w.get("status"),
                 "handle": (recent.get(wid) or (0, None))[1], "worktree_id": wid,
-                "group": group, "icon": icon,
+                "group": group,
             })
     items.sort(key=lambda it: (STATUS.get(it["state"], DEFAULT)[0], it["id"]))
     return items
 
 
-def fetch_repo_meta():
-    """(groups {repoId: groupId}, icons {repoId: repoIcon}, names {repoName: groupId})."""
+def fetch_repo_groups():
+    """({repoId: groupId}, {repoName: groupId}) from `orca repo list`."""
     repos = (_orca_json(["repo", "list", "--json"]) or {}).get("repos", [])
-    groups = {r["id"]: r.get("projectGroupId") for r in repos if r.get("id")}
-    icons = {r["id"]: r.get("repoIcon") for r in repos if r.get("id")}
-    names = {r.get("displayName"): r.get("projectGroupId") for r in repos}
-    return groups, icons, names
+    by_id = {r["id"]: r.get("projectGroupId") for r in repos if r.get("id")}
+    by_name = {r.get("displayName"): r.get("projectGroupId") for r in repos}
+    return by_id, by_name
 
 
 def fetch_items():
@@ -215,14 +185,12 @@ def fetch_items():
     if wt is None:
         return None
     terms = (_orca_json(["terminal", "list", "--json"]) or {}).get("terminals", [])
-    # Only pay for the repo-list query when icons or a group feature need it.
-    if SHOW_ICONS or GROUP_ACCENT or GROUP_FILTER or GROUP_PAGES:
-        groups, icons, names = fetch_repo_meta()
-    else:
-        groups, icons, names = {}, {}, {}
-    items = build_items(wt.get("worktrees", []), terms, groups, icons)
+    # Only pay for the repo-list query when a group feature needs it (identicons
+    # come straight from the repo name, which worktree ps already carries).
+    by_id, by_name = fetch_repo_groups() if (GROUP_ACCENT or GROUP_FILTER or GROUP_PAGES) else ({}, {})
+    items = build_items(wt.get("worktrees", []), terms, by_id)
     if GROUP_FILTER:
-        target = names.get(GROUP_FILTER)
+        target = by_name.get(GROUP_FILTER)
         items = [it for it in items if it.get("group") == target]
     return items
 
