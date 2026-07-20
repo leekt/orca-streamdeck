@@ -70,6 +70,20 @@ def test_group_color_stable_and_distinct():
     assert m.group_color(None) == (90, 90, 90)                # ungrouped fallback
 
 
+def test_build_items_attaches_icon_from_repo_id():
+    icon = {"type": "image", "src": "https://example/x.png"}
+    wts = [{"worktreeId": "W", "repoId": "R", "repo": "x", "displayName": "m",
+            "agents": [{"paneKey": "T1:L1", "state": "working"}]}]
+    items = m.build_items(wts, TERMS, {"R": "g"}, {"R": icon})
+    assert items[0]["icon"] == icon
+
+
+def test_icon_image_generates_monogram_when_no_icon():
+    item = {"repo": "smart-routing", "group": "g", "icon": None}
+    im = m.icon_image(item, 40)
+    assert im.size == (40, 40) and im.mode == "RGBA"
+
+
 def test_paginate_grouped_never_mixes_groups():
     items = [{"group": "a"}, {"group": "a"}, {"group": "b"}]
     # 3 keys -> 2 tiles/page; group a fills a page, group b starts a fresh one
