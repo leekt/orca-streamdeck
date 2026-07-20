@@ -70,18 +70,13 @@ def test_group_color_stable_and_distinct():
     assert m.group_color(None) == (90, 90, 90)                # ungrouped fallback
 
 
-def test_build_items_attaches_icon_from_repo_id():
-    icon = {"type": "image", "src": "https://example/x.png"}
-    wts = [{"worktreeId": "W", "repoId": "R", "repo": "x", "displayName": "m",
-            "agents": [{"paneKey": "T1:L1", "state": "working"}]}]
-    items = m.build_items(wts, TERMS, {"R": "g"}, {"R": icon})
-    assert items[0]["icon"] == icon
-
-
-def test_icon_image_generates_monogram_when_no_icon():
-    item = {"repo": "smart-routing", "group": "g", "icon": None}
-    im = m.icon_image(item, 40)
-    assert im.size == (40, 40) and im.mode == "RGBA"
+def test_icon_image_generates_identicon_per_repo():
+    a1 = m.icon_image({"repo": "kernel"}, 40)
+    a2 = m.icon_image({"repo": "kernel"}, 40)
+    b = m.icon_image({"repo": "deployer"}, 40)
+    assert a1.size == (40, 40) and a1.mode == "RGBA"
+    assert a1.tobytes() == a2.tobytes()   # deterministic per repo
+    assert a1.tobytes() != b.tobytes()    # distinct across repos
 
 
 def test_paginate_grouped_never_mixes_groups():
