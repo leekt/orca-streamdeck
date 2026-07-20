@@ -68,6 +68,17 @@ launchctl unload -w ~/Library/LaunchAgents/com.taek.orca-streamdeck.plist
 Tunables at the top of `orca_streamdeck.py`: `POLL_SECONDS`, `LONG_PRESS_SEC`,
 `DIM_BRIGHTNESS`, `PULSE`, and the `STATUS` color/urgency legend.
 
+**Project-group features** (Orca groups repos via `projectGroupId`) — all default
+**off**, so the pane stays urgency-flat until you enable one:
+
+- `GROUP_ACCENT = True` — draw a per-group color stripe down the left of each tile
+  (color derived from the group id, since repo `badgeColor`s are all default).
+- `GROUP_FILTER = "<repo name>"` — show only agents in that repo's group
+  (e.g. `"sra-dashboard"` → the whole SRA group).
+- `GROUP_PAGES = True` — one group per page instead of urgency-flat pagination.
+
+Enabling any of these adds one `orca repo list` query per poll.
+
 ## Test
 
 ```sh
