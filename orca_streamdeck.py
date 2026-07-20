@@ -138,7 +138,8 @@ def build_items(worktrees, terminals, repo_groups=None):
     # worktreeId -> handle of its most recently active terminal (fallback focus)
     recent = {}
     for t in terminals:
-        w, h, lo = t.get("worktreeId"), t.get("handle"), t.get("lastOutputAt", 0)
+        # lastOutputAt can be missing OR null -> coerce to 0 for comparison.
+        w, h, lo = t.get("worktreeId"), t.get("handle"), t.get("lastOutputAt") or 0
         if w and h and (w not in recent or lo > recent[w][0]):
             recent[w] = (lo, h)
 
