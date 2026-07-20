@@ -77,7 +77,13 @@ Tunables at the top of `orca_streamdeck.py`: `POLL_SECONDS`, `LONG_PRESS_SEC`,
   (e.g. `"sra-dashboard"` → the whole SRA group).
 - `GROUP_PAGES = True` — one group per page instead of urgency-flat pagination.
 
-Enabling any of these adds one `orca repo list` query per poll.
+Enabling any of these (or icons below) adds one `orca repo list` query per poll.
+
+**Per-project icons** (`SHOW_ICONS`, default **on**): each tile shows the project's
+icon — Orca's `repoIcon` (a GitHub owner avatar) when it has one, otherwise an
+auto-generated monogram on a group-colored disc. Downloads are cached under
+`~/.cache/orca-streamdeck/icons/`, so it works offline after the first fetch.
+Set `SHOW_ICONS = False` for the text-only layout.
 
 ## Test
 
