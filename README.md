@@ -79,11 +79,10 @@ Tunables at the top of `orca_streamdeck.py`: `POLL_SECONDS`, `LONG_PRESS_SEC`,
 
 Enabling any of these (or icons below) adds one `orca repo list` query per poll.
 
-**Per-project icons** (`SHOW_ICONS`, default **on**): each tile shows the project's
-icon — Orca's `repoIcon` (a GitHub owner avatar) when it has one, otherwise an
-auto-generated monogram on a group-colored disc. Downloads are cached under
-`~/.cache/orca-streamdeck/icons/`, so it works offline after the first fetch.
-Set `SHOW_ICONS = False` for the text-only layout.
+**Per-project icons** (`SHOW_ICONS`, default **on**): each tile shows an
+auto-generated **identicon** — a GitHub-style block pattern derived from the repo
+name, distinct per project, colored by the name hash. No network, no external
+avatars. Set `SHOW_ICONS = False` for the text-only layout.
 
 ## Test
 
