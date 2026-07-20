@@ -57,6 +57,26 @@ def test_build_items_agentless_worktree_uses_recent_terminal():
     assert len(items) == 1 and items[0]["handle"] == "h2"  # most recent (lastOutputAt=99)
 
 
+def test_build_items_attaches_group_from_repo_id():
+    wts = [{"worktreeId": "W", "repoId": "R", "repo": "x", "displayName": "m",
+            "agents": [{"paneKey": "T1:L1", "state": "working"}]}]
+    items = m.build_items(wts, TERMS, {"R": "grp-1"})
+    assert items[0]["group"] == "grp-1"
+
+
+def test_group_color_stable_and_distinct():
+    assert m.group_color("grp-1") == m.group_color("grp-1")   # deterministic
+    assert m.group_color("grp-1") != m.group_color("grp-2")   # distinct
+    assert m.group_color(None) == (90, 90, 90)                # ungrouped fallback
+
+
+def test_paginate_grouped_never_mixes_groups():
+    items = [{"group": "a"}, {"group": "a"}, {"group": "b"}]
+    # 3 keys -> 2 tiles/page; group a fills a page, group b starts a fresh one
+    assert m.paginate_grouped(items, 3) == [
+        [{"group": "a"}, {"group": "a"}], [{"group": "b"}]]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
