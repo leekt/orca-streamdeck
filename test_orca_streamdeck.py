@@ -50,6 +50,17 @@ def test_build_items_maps_agent_panekey_to_handle():
     assert items[1]["state"] == "working" and items[1]["handle"] == "h1"
 
 
+def test_build_items_handles_null_last_output_at():
+    # a terminal with lastOutputAt=None must not crash the recency comparison
+    terms = [{"tabId": "T", "leafId": "L", "handle": "h",
+              "worktreeId": "W", "lastOutputAt": None},
+             {"tabId": "T2", "leafId": "L2", "handle": "h2",
+              "worktreeId": "W", "lastOutputAt": 5}]
+    wts = [{"worktreeId": "W", "repo": "x", "displayName": "m",
+            "status": "active", "agents": []}]
+    assert m.build_items(wts, terms)[0]["handle"] == "h2"
+
+
 def test_build_items_agentless_worktree_uses_recent_terminal():
     wts = [{"worktreeId": "W", "repo": "x", "displayName": "m",
             "status": "active", "agents": []}]
