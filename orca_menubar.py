@@ -61,8 +61,7 @@ class OrcaBar(rumps.App):
             parent.add(rumps.MenuItem("Focus", callback=self._act(core.focus_terminal, it["handle"])))
             if it["handle"]:
                 parent.add(rumps.MenuItem(
-                    "Interrupt", callback=self._act(core.interrupt_terminal, it["handle"],
-                                                    f"{it['repo']}/{it['sub']}")))
+                    "Interrupt", callback=self._act(core.interrupt_terminal, it["handle"])))
             self.menu.add(parent)
 
 

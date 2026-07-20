@@ -5,7 +5,7 @@ Polls Orca and paints one tile per *agent*, sorted by urgency
 (needs input -> idle -> working) and colored by state. The bottom-right key is a
 status key: shows how many agents need you, and cycles pages when there are more
 agents than keys. The deck dims when nothing needs you and pulses when something
-does, plus a macOS notification on the transition.
+does. (Orca sends its own notifications, so this doesn't duplicate them.)
 
 Tap a tile   -> focus that agent's terminal in Orca (and raise the app).
 Hold a tile  -> interrupt that agent (Esc/Ctrl-C to its terminal). Interrupting
@@ -222,15 +222,6 @@ def paginate_grouped(items, key_count):
 
 # --- Actions ---------------------------------------------------------------
 
-def notify(title, message):
-    subprocess.Popen([
-        "osascript",
-        "-e", "on run {t, m}",
-        "-e", 'display notification m with title t sound name "Ping"',
-        "-e", "end run", title, message,
-    ])
-
-
 def focus_terminal(handle):
     if handle:
         subprocess.run(["orca", "terminal", "switch", "--terminal", handle],
@@ -238,10 +229,9 @@ def focus_terminal(handle):
     subprocess.Popen(["open", "-a", "Orca"])
 
 
-def interrupt_terminal(handle, label):
+def interrupt_terminal(handle):
     subprocess.run(["orca", "terminal", "send", "--terminal", handle, "--interrupt"],
                    capture_output=True, timeout=15)
-    notify("Interrupted", label)
 
 
 # --- Rendering -------------------------------------------------------------
@@ -330,17 +320,11 @@ def main():
             item = state["slots"][key] if key < n else None
         if not item:
             return
-        label = f"{item['repo']}/{item['sub']}"
-        if held >= LONG_PRESS_SEC and item["handle"]:
-            threading.Thread(target=interrupt_terminal,
-                             args=(item["handle"], label), daemon=True).start()
-        else:
-            threading.Thread(target=focus_terminal,
-                             args=(item["handle"],), daemon=True).start()
+        action = interrupt_terminal if (held >= LONG_PRESS_SEC and item["handle"]) else focus_terminal
+        threading.Thread(target=action, args=(item["handle"],), daemon=True).start()
 
     deck.set_key_callback(on_press)
 
-    prev_state = {}   # item id -> last state (notify on transition into NEEDS_HUMAN)
     pulse_on = False
     try:
         while True:
@@ -358,12 +342,6 @@ def main():
                     continue
 
                 count = sum(1 for it in items if it["state"] in NEEDS_HUMAN)
-                for it in items:
-                    if it["state"] in NEEDS_HUMAN and prev_state.get(it["id"]) not in NEEDS_HUMAN:
-                        notify(f"Orca: {it['repo']} needs you",
-                               f"{it['sub']} — {STATUS.get(it['state'], DEFAULT)[2]}")
-                prev_state = {it["id"]: it["state"] for it in items}
-
                 pages = paginate_grouped(items, n) if GROUP_PAGES else paginate(items, n)
                 page = state["page"] % len(pages)
                 page_items = pages[page]
