@@ -5,6 +5,9 @@ an attention-router across your fleet of agent sessions. Each key is one agent,
 colored by state; tap to jump to it, hold to interrupt it. A DIY take on the
 same idea as OpenAI's Codex Micro, on hardware you already own.
 
+Two faces over the same brains: the **Stream Deck** pane (`orca_streamdeck.py`)
+and a **macOS menu bar app** (`orca_menubar.py`) — use either or both.
+
 ## What it does
 
 - Polls `orca worktree ps` + `orca terminal list` every 2s and paints **one tile
@@ -47,7 +50,21 @@ Requires the Orca CLI reachable (`orca status`) and macOS.
 Quits Elgato's Stream Deck app (it holds the USB device exclusively) and runs the
 controller. Ctrl-C to stop; Elgato's app is left closed.
 
-### Run always-on (LaunchAgent)
+## Menu bar app
+
+A `rumps` menu bar app sharing the deck's logic — no Stream Deck required:
+
+```sh
+./.venv/bin/python orca_menubar.py
+```
+
+The title shows the needs-you count (`🔴 3`, or `🐳` when clear); the dropdown
+lists agents by urgency, each with **Focus** and **Interrupt**. Updates every
+`POLL_SECONDS` (a running process, so — unlike a WidgetKit widget — it's live).
+Always-on: `cp com.taek.orca-menubar.plist ~/Library/LaunchAgents/ && launchctl
+load -w ~/Library/LaunchAgents/com.taek.orca-menubar.plist`.
+
+## Run always-on (LaunchAgent)
 
 Auto-starts at login and restarts on crash:
 
@@ -95,7 +112,8 @@ Offline checks for urgency order, pagination, and the agent→terminal
 
 ## Files
 
-- `orca_streamdeck.py` — the controller
-- `run.sh` — launcher (device handoff, launchd-safe PATH/dyld)
-- `com.taek.orca-streamdeck.plist` — LaunchAgent for always-on
+- `orca_streamdeck.py` — the Stream Deck controller
+- `orca_menubar.py` — the macOS menu bar app (shares the controller's logic)
+- `run.sh` — Stream Deck launcher (device handoff, launchd-safe PATH/dyld)
+- `com.taek.orca-streamdeck.plist` / `com.taek.orca-menubar.plist` — LaunchAgents
 - `test_orca_streamdeck.py` — offline checks
