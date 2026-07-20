@@ -16,7 +16,9 @@ derived from the connected device. Screenless decks (Pedal) are not supported.
 
 Author: taek <leekt216@gmail.com>
 """
+import colorsys
 import functools
+import hashlib
 import json
 import subprocess
 import threading
@@ -30,6 +32,22 @@ POLL_SECONDS = 2.0
 LONG_PRESS_SEC = 0.7        # hold >= this to interrupt instead of focus
 DIM_BRIGHTNESS = 100        # when nothing needs you
 PULSE = (60, 100)           # brightness pulse endpoints when attention needed
+
+# --- Project-group features (all default OFF: the pane stays urgency-flat with
+# no group visuals until you turn one on). Orca groups repos via projectGroupId. ---
+GROUP_ACCENT = False        # draw a per-group color stripe down the left of each tile
+GROUP_FILTER = None         # a repo displayName; show only agents in THAT repo's group
+GROUP_PAGES = False         # one group per page instead of urgency-flat pagination
+
+
+def group_color(group_id):
+    """Stable, vivid color derived from a group id (repo badgeColors are all the
+    same default, so we hash the id into a distinct hue instead)."""
+    if not group_id:
+        return (90, 90, 90)
+    hue = int(hashlib.md5(group_id.encode()).hexdigest(), 16) % 360 / 360
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 0.95)
+    return (round(r * 255), round(g * 255), round(b * 255))
 
 # Urgency ranking (lower sorts to the front) + color legend, aligned to the
 # OpenAI Codex Micro convention: red=stopped/error, amber=needs input,
@@ -77,9 +95,11 @@ def _orca_json(args):
         return None
 
 
-def build_items(worktrees, terminals):
+def build_items(worktrees, terminals, repo_groups=None):
     """Flat, urgency-sorted list of agent tiles. Pure — no I/O, so it's testable.
-    Each item: {id, repo, sub, state, handle, worktree_id}."""
+    Each item: {id, repo, sub, state, handle, worktree_id, group}.
+    repo_groups maps repoId -> projectGroupId (None -> group left unset)."""
+    repo_groups = repo_groups or {}
     # agent paneKey ("{tabId}:{leafId}") -> terminal handle
     by_pane = {f"{t.get('tabId')}:{t.get('leafId')}": t.get("handle") for t in terminals}
     # worktreeId -> handle of its most recently active terminal (fallback focus)
@@ -93,6 +113,7 @@ def build_items(worktrees, terminals):
     for w in worktrees:
         wid, repo = w["worktreeId"], w.get("repo", "?")
         branch = w.get("displayName") or ""
+        group = repo_groups.get(w.get("repoId"))
         agents = w.get("agents") or []
         if agents:
             for a in agents:
@@ -105,14 +126,24 @@ def build_items(worktrees, terminals):
                     "state": "interrupted" if a.get("interrupted") else a.get("state"),
                     "handle": handle,
                     "worktree_id": wid,
+                    "group": group,
                 })
         else:  # worktree with no agent session — show it at worktree level
             items.append({
                 "id": wid, "repo": repo, "sub": branch, "state": w.get("status"),
                 "handle": (recent.get(wid) or (0, None))[1], "worktree_id": wid,
+                "group": group,
             })
     items.sort(key=lambda it: (STATUS.get(it["state"], DEFAULT)[0], it["id"]))
     return items
+
+
+def fetch_repo_groups():
+    """({repoId: groupId}, {repoName: groupId}) from `orca repo list`."""
+    repos = (_orca_json(["repo", "list", "--json"]) or {}).get("repos", [])
+    by_id = {r["id"]: r.get("projectGroupId") for r in repos if r.get("id")}
+    by_name = {r.get("displayName"): r.get("projectGroupId") for r in repos}
+    return by_id, by_name
 
 
 def fetch_items():
@@ -121,7 +152,13 @@ def fetch_items():
     if wt is None:
         return None
     terms = (_orca_json(["terminal", "list", "--json"]) or {}).get("terminals", [])
-    return build_items(wt.get("worktrees", []), terms)
+    # Only pay for the repo-list query when a group feature actually needs it.
+    by_id, by_name = fetch_repo_groups() if (GROUP_ACCENT or GROUP_FILTER or GROUP_PAGES) else ({}, {})
+    items = build_items(wt.get("worktrees", []), terms, by_id)
+    if GROUP_FILTER:
+        target = by_name.get(GROUP_FILTER)
+        items = [it for it in items if it.get("group") == target]
+    return items
 
 
 def paginate(items, key_count):
@@ -129,6 +166,24 @@ def paginate(items, key_count):
     per = max(1, key_count - 1)
     pages = [items[i:i + per] for i in range(0, len(items), per)] or [[]]
     return pages
+
+
+def paginate_grouped(items, key_count):
+    """Like paginate, but never mixes groups on a page. Groups appear in order of
+    their most-urgent agent (items arrive urgency-sorted)."""
+    per = max(1, key_count - 1)
+    order, buckets = [], {}
+    for it in items:
+        g = it.get("group")
+        if g not in buckets:
+            buckets[g] = []
+            order.append(g)
+        buckets[g].append(it)
+    pages = []
+    for g in order:
+        b = buckets[g]
+        pages += [b[i:i + per] for i in range(0, len(b), per)]
+    return pages or [[]]
 
 
 # --- Actions ---------------------------------------------------------------
@@ -173,6 +228,8 @@ def render_tile(deck, item):
               font=load_font(round(w * 0.13)), anchor="mm", fill=sub_fg)
     draw.text((w // 2, h - h * 0.13), label, font=load_font(round(w * 0.13)),
               anchor="mm", fill=fg)
+    if GROUP_ACCENT and item.get("group"):
+        draw.rectangle([0, 0, max(3, w * 0.09), h], fill=group_color(item["group"]))
     return PILHelper.to_native_format(deck, img)
 
 
@@ -266,7 +323,7 @@ def main():
                                f"{it['sub']} — {STATUS.get(it['state'], DEFAULT)[2]}")
                 prev_state = {it["id"]: it["state"] for it in items}
 
-                pages = paginate(items, n)
+                pages = paginate_grouped(items, n) if GROUP_PAGES else paginate(items, n)
                 page = state["page"] % len(pages)
                 page_items = pages[page]
                 slots = [None] * n
