@@ -2,7 +2,7 @@
 
 Turn any Elgato **Stream Deck** into a live control pane for [Orca](https://www.orcastudio.io/) —
 an attention-router across your fleet of agent sessions. Each key is one agent,
-colored by state; tap to jump to it, hold to interrupt it. A DIY take on the
+colored by state; tap for its action page, hold to interrupt it. A DIY take on the
 same idea as OpenAI's Codex Micro, on hardware you already own.
 
 Two faces over the same brains: the **Stream Deck** pane (`orca_streamdeck.py`)
@@ -182,14 +182,13 @@ launchctl unload -w ~/Library/LaunchAgents/com.taek.orca-streamdeck.plist
 Tunables at the top of `orca_streamdeck.py`: `POLL_SECONDS`, `LONG_PRESS_SEC`,
 `DIM_BRIGHTNESS`, `PULSE`, `AUTO_DURATIONS`, and the `STATUS` color/urgency legend.
 
-**Project-group features** (Orca groups repos via `projectGroupId`) — all default
-**off**, so the pane stays urgency-flat until you enable one:
-
-- `GROUP_ACCENT = True` — draw a per-group color stripe down the left of each tile
-  (color derived from the group id, since repo `badgeColor`s are all default).
-- `GROUP_FILTER = "<repo name>"` — show only agents in that repo's group
-  (e.g. `"sra-dashboard"` → the whole SRA group).
-- `GROUP_PAGES = True` — one group per page instead of urgency-flat pagination.
+**Project groups** — `GROUP_ACCENT = True` draws a per-group stripe down the left
+of each tile (color hashed from `projectGroupId`, since every repo `badgeColor` is
+the same default). Off by default: the right edge is already the machine stripe,
+and two stripes plus three corner marks is mush on a Mini key. It earns its place
+on an XL. Group *filtering* and *per-group pages* were removed — Orca's CLI
+exposes no group **names**, only opaque ids, so both were unlabelled, and both
+fought the urgency ordering that makes this an attention router rather than a map.
 
 Enabling any of these (or icons below) adds one `orca repo list` query per poll.
 
@@ -197,6 +196,25 @@ Enabling any of these (or icons below) adds one `orca repo list` query per poll.
 auto-generated **identicon** — a GitHub-style block pattern derived from the repo
 name, distinct per project, colored by the name hash. No network, no external
 avatars. Set `SHOW_ICONS = False` for the text-only layout.
+
+## Worktree cleanup
+
+```sh
+./.venv/bin/python orca_cleanup.py             # report only, changes nothing
+./.venv/bin/python orca_cleanup.py --complete  # mark them done on Orca's board
+./.venv/bin/python orca_cleanup.py --remove    # delete from Orca AND git
+```
+
+Finds finished worktrees on every machine and says why each one qualifies.
+"Finished" is deliberately narrow: **a merged/closed linked PR and no live
+terminals**. Absence of evidence is never evidence — no PR or no recent activity
+means *keep*, because the CLI exposes no dirty-tree check and an idle-looking
+worktree may hold the only copy of something.
+
+Never a candidate: main worktrees, archived ones, anything with a live terminal,
+anything whose PR is still open. `--remove` asks per worktree — a batch `y` is how
+you delete the wrong thing. This is deliberately **not** a deck key: removing a
+git worktree shouldn't be one keypress away from a tile.
 
 ## Test
 
@@ -211,6 +229,7 @@ Offline checks for urgency order, pagination, and the agent→terminal
 
 - `orca_streamdeck.py` — the Stream Deck controller
 - `orca_menubar.py` — the macOS menu bar app (shares the controller's logic)
+- `orca_cleanup.py` — finished-worktree report and cleanup (see above)
 - `orca_autoapprove.py` — opt-in codex approval auto-presser (see above)
 - `run.sh` — Stream Deck launcher (device handoff, launchd-safe PATH/dyld)
 - `com.taek.orca-streamdeck.plist` / `com.taek.orca-menubar.plist` — LaunchAgents
