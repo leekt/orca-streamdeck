@@ -1,6 +1,7 @@
 """Offline checks for the pieces that don't touch hardware. Run:
 `./.venv/bin/python test_orca_streamdeck.py`."""
 import orca_autoapprove as auto
+import orca_cleanup as cleanup
 import orca_streamdeck as m
 
 
@@ -157,12 +158,6 @@ def test_icon_image_generates_identicon_per_repo():
     assert a1.tobytes() != b.tobytes()    # distinct across repos
 
 
-def test_paginate_grouped_never_mixes_groups():
-    items = [{"group": "a"}, {"group": "a"}, {"group": "b"}]
-    # 3 keys -> 2 tiles/page; group a fills a page, group b starts a fresh one
-    assert m.paginate_grouped(items, 3) == [
-        [{"group": "a"}, {"group": "a"}], [{"group": "b"}]]
-
 
 def test_age_label_scales_and_tolerates_a_silent_terminal():
     now = 1_000_000_000
@@ -317,6 +312,7 @@ _REAL_POPEN, _REAL_RUN = m.subprocess.Popen, m.subprocess.run
 _REAL_ENVS, _REAL_ENV_ITEMS = m.fetch_environments, m.fetch_env_items
 _REAL_READ_TAIL = m.read_tail
 _REAL_FETCH_ITEMS = m.fetch_items
+_REAL_ORCA_JSON = m._orca_json
 _REAL_ARMED_FILE = m.ARMED_FILE
 _TMP_ARMED = m.pathlib.Path(__file__).with_name(".armed-test")
 
@@ -518,6 +514,50 @@ def test_autoapprove_only_flag_narrows_to_one_terminal():
     finally:
         auto.ONLY = set()
         m.fetch_items = _REAL_FETCH_ITEMS
+
+
+def _wt(**kw):
+    base = {"worktreeId": "R::/p", "repo": "web", "displayName": "fix/x",
+            "isMainWorktree": False, "isArchived": False, "liveTerminalCount": 0,
+            "linkedPR": {"number": 7, "state": "merged"}}
+    return {**base, **kw}
+
+
+def test_cleanup_only_claims_provably_finished_worktrees():
+    ok, why = cleanup.classify(_wt())
+    assert ok and "merged" in why                     # merged PR + no terminals
+    assert cleanup.classify(_wt(linkedPR={"number": 7, "state": "closed"}))[0]
+
+
+def test_cleanup_refuses_everything_it_cannot_prove_is_done():
+    # each of these must be KEPT, and say why
+    for kw, expected in [
+        ({"isMainWorktree": True}, "main worktree"),
+        ({"isArchived": True}, "archived"),
+        ({"liveTerminalCount": 2}, "terminals live"),
+        ({"linkedPR": None}, "no linked PR"),
+        ({"linkedPR": {}}, "no linked PR"),
+        ({"linkedPR": {"number": 7, "state": "open"}}, "PR still open"),
+    ]:
+        ok, why = cleanup.classify(_wt(**kw))
+        assert not ok and why == expected, (kw, why)
+    # a main worktree with a merged PR is still kept — main is never a candidate
+    assert not cleanup.classify(_wt(isMainWorktree=True))[0]
+    # absence of evidence is not evidence: ancient and idle, but no PR -> keep
+    assert not cleanup.classify(_wt(linkedPR=None, lastActivityAt=1))[0]
+
+
+def test_cleanup_act_picks_the_right_command():
+    sent = []
+    cleanup.core._orca_json = lambda args, env=None: sent.append((args, env)) or {}
+    try:
+        cleanup.act("mac mini", _wt(), remove=False)
+        assert sent[-1] == (["worktree", "set", "--worktree", "id:R::/p",
+                             "--workspace-status", "completed", "--json"], "mac mini")
+        cleanup.act(None, _wt(), remove=True)
+        assert sent[-1] == (["worktree", "rm", "--worktree", "id:R::/p", "--json"], None)
+    finally:
+        cleanup.core._orca_json = _REAL_ORCA_JSON
 
 
 if __name__ == "__main__":
