@@ -16,88 +16,27 @@ Run: ./.venv/bin/python orca_autoapprove.py
 Author: taek <leekt216@gmail.com>
 """
 import subprocess
+import sys
 import time
 
 import orca_streamdeck as core
 
+# `--only <handle>` (repeatable) narrows blind approval to specific terminals, so
+# the deck can say "trust THIS agent" instead of "trust the fleet".
+ONLY = {sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--only"
+        and i + 1 < len(sys.argv)}
+
+# The pure detection (markers, is_blocked, wants_approval, describe) lives in the
+# core so the deck's agent page can show what an agent is asking without importing
+# this module — that direction would be an import cycle.
+from orca_streamdeck import (MARKERS, SQUASHED, TITLE_MARKER,  # noqa: E402,F401
+                             _squash, is_blocked, wants_approval, describe,
+                             read_tail)
+
 AGENT_TYPE = "codex"
 RETRY_SECONDS = 4.0   # per terminal: leave the screen time to repaint after an Enter
-TAIL_LINES = 40       # how far back to look for the modal (it isn't always last)
 REPOS = None          # set to e.g. {"orchestra-web"} to blind-approve in those
                       # repos only; None means the whole fleet
-
-# Modal headers + the shared confirm footer, lifted from the codex 0.145.0
-# binary's string table. The footer alone catches modal kinds not listed here;
-# the headers survive a redraw that clips the footer.
-MARKERS = (
-    "Press enter to confirm",                        # every approval modal
-    "Would you like to run the following command?",  # exec
-    "Would you like to make the following edits?",   # patch / apply_patch
-    "Would you like to grant these permissions?",    # sandbox escalation
-    "Do you want to approve network access to",      # network
-    "needs your approval.",                          # MCP tool call
-)
-# Deliberately NOT matched: codex's ask-the-user question widget ("enter to
-# submit answer"). Enter there would submit a blank answer; that one is yours.
-
-# Orca's own per-tab blocked flag ("[ ! ] Action Required | <repo>"). This is the
-# LIVE half of the signal: codex's output stream has no liveness at all — a
-# quiesced agent draws its modal once and never repaints, so "is a modal still
-# up?" is unanswerable from the terminal alone. Orca clears this the moment the
-# agent unblocks, which is what stops us pressing Enter at stale modal text.
-TITLE_MARKER = "action required"
-
-
-def _squash(s):
-    """Drop all whitespace — the terminal comes back as TUI redraw frames with
-    spaces eaten ("2.No,andtellCodexwhattododifferently"), so spaced substrings
-    don't survive."""
-    return "".join(s.split()).lower()
-
-
-SQUASHED = tuple(_squash(mk) for mk in MARKERS)
-
-
-def is_blocked(title):
-    """Orca says this tab is waiting on the human. Free — the title rides along on
-    the `terminal list` that fetch_items already makes."""
-    return TITLE_MARKER in (title or "").lower()
-
-
-def wants_approval(tail, title):
-    """True if this terminal is blocked *on an approval modal*. Pure.
-
-    Needs both halves: the title alone can't tell an approval apart from an agent
-    that simply finished, and the tail alone has no notion of "still on screen"."""
-    return is_blocked(title) and any(mk in _squash(tail) for mk in SQUASHED)
-
-
-def describe(tail):
-    """What we're about to say yes to, for the log — the modal's kind plus the
-    text it's asking about. "approved <handle>" alone leaves no audit trail of
-    what a blind daemon agreed to on your behalf."""
-    flat = " ".join(tail.split())
-    for raw, squashed in zip(MARKERS[1:], SQUASHED[1:]):   # [0] is the generic footer
-        i = flat.find(raw)
-        if i >= 0:
-            return f"{raw.rstrip('?.')} — {flat[max(0, i - 90):i].strip()}".rstrip(" —")
-        if squashed in _squash(flat):       # redraw ate the spaces; kind only
-            return raw.rstrip("?.")
-    # exec modals often carry no header at all, just the option list — the command
-    # being approved is whatever precedes it.
-    i = flat.find("1. Yes")
-    return flat[max(0, i - 90):i].strip() if i > 0 else "approval modal"
-
-
-def read_tail(handle, env=None):
-    """The last TAIL_LINES of output, as one blob.
-
-    Not `terminal show`'s preview: that's 300 chars of the same stream, and a
-    modal often sits further back than that (the transcript keeps printing after
-    it's drawn), so it silently misses exactly the case we care about."""
-    r = core._orca_json(["terminal", "read", "--terminal", handle,
-                         "--limit", str(TAIL_LINES), "--json"], env) or {}
-    return "".join((r.get("terminal") or {}).get("tail") or [])
 
 
 def approve(handle, env=None):
@@ -117,6 +56,8 @@ def poll(sent_at, now):
     for it in (core.fetch_items() or []):
         h, env = it["handle"], it.get("env")
         if it.get("agent_type") != AGENT_TYPE or not h or not is_blocked(it.get("title")):
+            continue
+        if ONLY and h not in ONLY:
             continue
         if REPOS is not None and it["repo"] not in REPOS:
             continue

@@ -233,6 +233,20 @@ def build_items(worktrees, terminals, repo_groups=None, env=None):
     return items
 
 
+TAIL_LINES = 40             # how far back to look for a modal (not always last)
+
+
+def read_tail(handle, env=None):
+    """The last TAIL_LINES of a terminal's output, as one blob.
+
+    Not `terminal show`'s preview: that's 300 chars of the same stream, and a
+    modal often sits further back than that (the transcript keeps printing after
+    it's drawn), so it silently misses exactly the case we care about."""
+    r = _orca_json(["terminal", "read", "--terminal", handle,
+                    "--limit", str(TAIL_LINES), "--json"], env) or {}
+    return "".join((r.get("terminal") or {}).get("tail") or [])
+
+
 def fetch_repo_groups(env=None):
     """({repoId: groupId}, {repoName: groupId}) from `orca repo list`."""
     repos = (_orca_json(["repo", "list", "--json"], env) or {}).get("repos", [])
@@ -324,6 +338,26 @@ def interrupt_terminal(handle, env=None):
     send_to_terminal(["terminal", "send", "--interrupt"], handle, env)
 
 
+ESC = "\033"
+
+
+def deny_terminal(handle, env=None):
+    """Escape out of whatever modal is up — codex maps esc to "No, and tell Codex
+    what to do differently", so this is a refusal, not a kill."""
+    send_to_terminal(["terminal", "send", "--text", ESC], handle, env)
+
+
+def open_changed(worktree_id, env=None):
+    """Open every git-changed file for a worktree as diffs in Orca's editor —
+    "it says it's done" straight to reviewing what it actually wrote."""
+    if worktree_id:
+        subprocess.run(_orca_cmd(["file", "open-changed", "--mode", "diff",
+                                  "--worktree", f"id:{worktree_id}"], env),
+                       capture_output=True, timeout=15)
+        if not env:
+            subprocess.Popen(["open", "-a", "Orca"])
+
+
 # ponytail: run the auto-approver as a child process rather than importing it —
 # it imports this module, so in-process would mean an import cycle. Its log lines
 # land in the deck's own log, and it dies with the deck.
@@ -351,9 +385,9 @@ def disarm_autoapprove(proc):
     return None, None
 
 
-def arm_autoapprove(proc, minutes, now, idx=0):
-    """Run the codex auto-approver for `minutes` (None = forever).
-    Returns (process, expiry epoch).
+def arm_autoapprove(proc, minutes, now, idx=0, only=None):
+    """Run the codex auto-approver for `minutes` (None = forever), optionally
+    scoped to a single terminal handle. Returns (process, expiry epoch).
 
     The deadline is written to disk so a deck crash (launchd restarts us) comes
     back armed instead of silently dropping to off — but a timed window can't be
@@ -362,6 +396,10 @@ def arm_autoapprove(proc, minutes, now, idx=0):
     disarm_autoapprove(proc)
     subprocess.run(["pkill", "-f", "orca_autoapprove.py"], capture_output=True)
     until = FOREVER if minutes is None else now + minutes * 60
+    # A scoped arming is deliberately NOT persisted: resuming "trust one agent"
+    # after a restart would re-target a handle that may no longer exist.
+    if only:
+        return subprocess.Popen([*AUTO_APPROVE_CMD, "--only", only]), until
     ARMED_FILE.write_text(f"{until} {idx}")
     return subprocess.Popen(AUTO_APPROVE_CMD), until
 
@@ -388,11 +426,14 @@ def armed_state(now):
 
 # --- Rendering -------------------------------------------------------------
 
-def render_tile(deck, item, now_ms=0):
+def render_tile(deck, item, now_ms=0, wash=None):
     img = PILHelper.create_image(deck)
     draw = ImageDraw.Draw(img)
     w, h = img.size
     if item is None:
+        if wash:    # empty keys glow with the fleet's worst state, so the unit
+            draw.rectangle([0, 0, w, h],     # reads from across the room
+                           fill=tuple(round(c * 0.35) for c in wash))
         return PILHelper.to_native_format(deck, img)
     _, color, label = STATUS.get(item["state"], DEFAULT)
     fg = text_color(color)
@@ -428,6 +469,131 @@ def render_tile(deck, item, now_ms=0):
     if GROUP_ACCENT and item.get("group"):
         draw.rectangle([0, 0, max(3, w * 0.09), h], fill=group_color(item["group"]))
     return PILHelper.to_native_format(deck, img)
+
+
+# --- Codex approval modals --------------------------------------------------
+# Pure detection, shared by the auto-approver (which presses Enter on these) and
+# the agent page (which shows you what an agent is stuck on). Headers + the shared
+# confirm footer, lifted from the codex 0.145.0 binary's string table; the footer
+# catches modal kinds not listed, the headers survive a redraw clipping the footer.
+MARKERS = (
+    "Press enter to confirm",                        # every approval modal
+    "Would you like to run the following command?",  # exec
+    "Would you like to make the following edits?",   # patch / apply_patch
+    "Would you like to grant these permissions?",    # sandbox escalation
+    "Do you want to approve network access to",      # network
+    "needs your approval.",                          # MCP tool call
+)
+# Deliberately NOT matched: codex's ask-the-user question widget ("enter to
+# submit answer"). Enter there would submit a blank answer; that one is yours.
+
+# Orca's own per-tab blocked flag ("[ ! ] Action Required | <repo>"). This is the
+# LIVE half of the signal: codex's output stream has no liveness at all — a
+# quiesced agent draws its modal once and never repaints, so "is a modal still
+# up?" is unanswerable from the terminal alone. Orca clears this the moment the
+# agent unblocks, which is what stops us pressing Enter at stale modal text.
+TITLE_MARKER = "action required"
+
+
+def _squash(s):
+    """Drop all whitespace — the terminal comes back as TUI redraw frames with
+    spaces eaten ("2.No,andtellCodexwhattododifferently"), so spaced substrings
+    don't survive."""
+    return "".join(s.split()).lower()
+
+
+SQUASHED = tuple(_squash(mk) for mk in MARKERS)
+
+
+def is_blocked(title):
+    """Orca says this tab is waiting on the human. Free — the title rides along on
+    the `terminal list` that fetch_items already makes."""
+    return TITLE_MARKER in (title or "").lower()
+
+
+def wants_approval(tail, title):
+    """True if this terminal is blocked *on an approval modal*. Pure.
+
+    Needs both halves: the title alone can't tell an approval apart from an agent
+    that simply finished, and the tail alone has no notion of "still on screen"."""
+    return is_blocked(title) and any(mk in _squash(tail) for mk in SQUASHED)
+
+
+def describe(tail):
+    """What is being said yes to — the modal's kind plus the text it asks about.
+    "approved <handle>" alone leaves no audit trail of what a blind daemon agreed
+    to on your behalf, and the agent page needs the same string on its key."""
+    flat = " ".join(tail.split())
+    for raw, squashed in zip(MARKERS[1:], SQUASHED[1:]):   # [0] is the generic footer
+        i = flat.find(raw)
+        if i >= 0:
+            return f"{raw.rstrip('?.')} — {flat[max(0, i - 90):i].strip()}".rstrip(" —")
+        if squashed in _squash(flat):       # redraw ate the spaces; kind only
+            return raw.rstrip("?.")
+    # exec modals often carry no header at all, just the option list — the command
+    # being approved is whatever precedes it.
+    i = flat.find("1. Yes")
+    return flat[max(0, i - 90):i].strip() if i > 0 else "approval modal"
+
+
+# --- Agent page: tap a tile to drill into one agent -------------------------
+# Each entry: (label, subtitle-key, color). The subtitle is filled in per agent.
+AGENT_PAGE_IDLE = 30.0      # seconds before the deck falls back to the fleet
+ACTIONS = ("focus", "approve", "auto", "interrupt", "diffs")
+ACTION_LOOK = {
+    "focus":     ("FOCUS", (55, 90, 150)),
+    "approve":   ("APPRV", (35, 130, 70)),
+    "auto":      ("AUTO", (180, 120, 20)),
+    "interrupt": ("INTR", (150, 45, 45)),
+    "diffs":     ("DIFFS", (70, 70, 80)),
+}
+
+
+def render_action(deck, label, sub="", color=(60, 60, 66), enabled=True):
+    """One key on the agent page: a verb, and what it will do right now."""
+    img = PILHelper.create_image(deck)
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+    if not enabled:
+        color = tuple(round(c * 0.3) for c in color)
+    draw.rectangle([0, 0, w, h], fill=color)
+    fg = text_color(color) if enabled else (120, 120, 126)
+    draw.text((w // 2, h // 2 - (h * 0.12 if sub else 0)), label,
+              font=load_font(round(w * 0.19)), anchor="mm", fill=fg)
+    if sub:
+        draw.text((w // 2, h // 2 + h * 0.18), sub[:12],
+                  font=load_font(round(w * 0.12)), anchor="mm", fill=fg)
+    return PILHelper.to_native_format(deck, img)
+
+
+def action_state(name, item, ask, auto_only):
+    """(subtitle, enabled) for one action key, given the agent it's aimed at."""
+    if name == "approve":
+        return (ask or "nothing", bool(ask))
+    if name == "auto":
+        return ("on" if auto_only == item["handle"] else "this one",
+                item.get("agent_type") == "codex")
+    if name == "interrupt":
+        return ("", bool(item["handle"]))
+    if name == "diffs":
+        return ("", bool(item.get("worktree_id")))
+    return ("", True)
+
+
+def render_agent_page(deck, item, n, nav_key, ask, auto_only, now_ms):
+    """The whole drill-down: one key per action, status key becomes Back."""
+    images = {}
+    for k in range(n):
+        if k == nav_key:
+            images[k] = render_action(deck, "BACK", item["repo"][:11], (40, 42, 50))
+        elif k < len(ACTIONS):
+            name = ACTIONS[k]
+            label, color = ACTION_LOOK[name]
+            sub, enabled = action_state(name, item, ask, auto_only)
+            images[k] = render_action(deck, label, sub, color, enabled)
+        else:
+            images[k] = render_tile(deck, None)
+    return images
 
 
 def auto_badge(until, now):
@@ -477,12 +643,26 @@ def repaint(deck, state, n, nav_key):
     items = state["items"]
     now = time.time()
     count = sum(1 for it in items if it["state"] in NEEDS_HUMAN)
+    p = state["auto"]
+    alive = bool(p and p.poll() is None)        # False again if it died on its own
+
+    if state["focused"]:                        # drilled into one agent
+        for k, img in render_agent_page(deck, state["focused"], n, nav_key,
+                                        state["focused_ask"],
+                                        state["auto_only"] if alive else None,
+                                        now * 1000).items():
+            deck.set_key_image(k, img)
+        return count
+
     pages = paginate_grouped(items, n) if GROUP_PAGES else paginate(items, n)
     page = state["page"] % len(pages)
     page_items = pages[page]
-    p = state["auto"]
-    alive = bool(p and p.poll() is None)        # False again if it died on its own
     badge = auto_badge(state["auto_until"] if alive else None, now)
+    # Worst state in the fleet washes the empty keys — only when it's something
+    # you'd want to notice, so a calm fleet stays dark.
+    worst = min((STATUS.get(it["state"], DEFAULT) for it in items),
+                key=lambda s: s[0], default=DEFAULT)
+    wash = worst[1] if worst[0] <= STATUS["waiting"][0] else None
     slots = [None] * n
     for k in range(n):
         if k == nav_key:
@@ -492,9 +672,94 @@ def repaint(deck, state, n, nav_key):
             slots[k] = page_items[k]
             deck.set_key_image(k, render_tile(deck, page_items[k], now * 1000))
         else:
-            deck.set_key_image(k, render_tile(deck, None))
+            deck.set_key_image(k, render_tile(deck, None, wash=wash))
     state.update(page=page, pages=len(pages), slots=slots)
     return count
+
+
+ASK_KINDS = ((" command", "command"), (" edits", "edits"), ("permissions", "perms"),
+             ("network", "network"), ("approval", "tool"))
+
+
+def ask_label(description):
+    """Squeeze describe()'s sentence into the handful of characters a key holds."""
+    low = description.lower()
+    for needle, short in ASK_KINDS:
+        if needle in low:
+            return short
+    return "approve?"
+
+
+def urgent_first(items):
+    """The agent that most needs you, or None when the fleet is calm."""
+    blocked = [it for it in items if it["state"] in NEEDS_HUMAN
+               or it["state"] == "interrupted"]
+    return min(blocked, key=urgency_key, default=None)
+
+
+def page_of(items, key_count, item):
+    """Which page an item lands on, so the deck can jump straight there."""
+    if not item:
+        return 0
+    pages = paginate_grouped(items, key_count) if GROUP_PAGES else paginate(items, key_count)
+    for i, page in enumerate(pages):
+        if any(it["id"] == item["id"] for it in page):
+            return i
+    return 0
+
+
+def refresh_focus(state, items):
+    """Keep the open agent page pointing at live data: re-bind it to this poll's
+    item, drop it once it's gone or idle, and refresh what it's waiting on."""
+    focused = state["focused"]
+    if not focused:
+        return
+    if time.monotonic() - state["focused_at"] > AGENT_PAGE_IDLE:
+        state.update(focused=None, focused_ask="")
+        return
+    fresh = next((it for it in items if it["id"] == focused["id"]), None)
+    if fresh is None:                   # the agent went away while you were in it
+        state.update(focused=None, focused_ask="")
+        return
+    state["focused"] = fresh
+    ask = ""
+    if fresh.get("agent_type") == "codex" and is_blocked(fresh.get("title")):
+        tail = read_tail(fresh["handle"], fresh.get("env"))
+        if wants_approval(tail, fresh["title"]):
+            ask = ask_label(describe(tail))
+    state["focused_ask"] = ask
+
+
+def agent_action(state, act, item, held, run):
+    """Perform one agent-page action and return the state changes it implies.
+    `run` fires the orca call off-thread so the deck stays responsive."""
+    handle, env = item["handle"], item.get("env")
+    if act == "focus":
+        run(focus_terminal, handle, env)
+        return {"focused": None}                # you're leaving the deck anyway
+    if act == "interrupt":
+        run(interrupt_terminal, handle, env)
+    elif act == "diffs":
+        run(open_changed, item.get("worktree_id"), env)
+        return {"focused": None}
+    elif act == "approve":
+        # tap says yes to what's on screen, hold escapes out of it instead
+        run(deny_terminal if held >= LONG_PRESS_SEC else send_to_terminal_enter,
+            handle, env)
+    elif act == "auto":
+        if state["auto_only"] == handle:        # already trusting this one -> stop
+            proc, until = disarm_autoapprove(state["auto"])
+            return {"auto": proc, "auto_until": until, "auto_only": None}
+        proc, until = arm_autoapprove(state["auto"], AUTO_DURATIONS[0],
+                                      time.time(), 0, only=handle)
+        return {"auto": proc, "auto_until": until, "auto_only": handle,
+                "auto_idx": -1}                 # scoped, so not a fleet duration
+    return {}
+
+
+def send_to_terminal_enter(handle, env=None):
+    """Press Enter — the same key the auto-approver sends, but because you asked."""
+    send_to_terminal(["terminal", "send", "--enter"], handle, env)
 
 
 def main():
@@ -513,7 +778,10 @@ def main():
     # slots[k] = item or None; auto = the auto-approver child, auto_until its
     # expiry, auto_idx which AUTO_DURATIONS entry is active (-1 = off)
     state = {"page": 0, "pages": 1, "slots": [None] * n, "items": [],
-             "auto": None, "auto_until": None, "auto_idx": -1}
+             "auto": None, "auto_until": None, "auto_idx": -1, "auto_only": None,
+             # focused = the agent whose page is open; focused_ask = what it's
+             # waiting on, refreshed by the poll loop while that page is up
+             "focused": None, "focused_at": 0.0, "focused_ask": ""}
     press_at = {}  # key -> monotonic time of key-down
 
     resumed = armed_state(time.time())          # armed when the deck last died?
@@ -528,27 +796,46 @@ def main():
             press_at[key] = time.monotonic()
             return
         held = time.monotonic() - press_at.pop(key, time.monotonic())
+        run = lambda fn, *a: threading.Thread(target=fn, args=a, daemon=True).start()
         with lock:
-            if key == nav_key:
+            focused = state["focused"]
+            if focused:                         # --- agent page ---
+                state["focused_at"] = time.monotonic()
+                if key == nav_key or key >= len(ACTIONS):
+                    state["focused"] = None     # Back
+                else:
+                    act = ACTIONS[key]
+                    state.update(**agent_action(state, act, focused, held, run))
+                repaint(deck, state, n, nav_key)
+                wake.set()
+                return
+
+            if key == nav_key:                  # --- fleet: status key ---
                 if held >= LONG_PRESS_SEC:      # hold = next auto-approve duration
                     (state["auto"], state["auto_until"],
                      state["auto_idx"]) = cycle_autoapprove(
                         state["auto"], state["auto_idx"], time.time())
+                    state["auto_only"] = None
                 elif state["pages"] > 1:
                     state["page"] = (state["page"] + 1) % state["pages"]
                 repaint(deck, state, n, nav_key)   # don't wait for the next poll
                 wake.set()
                 return
+
             item = state["slots"][key] if key < n else None
-        if not item:
-            return
-        action = interrupt_terminal if (held >= LONG_PRESS_SEC and item["handle"]) else focus_terminal
-        threading.Thread(target=action, args=(item["handle"], item.get("env")),
-                         daemon=True).start()
+            if item and held < LONG_PRESS_SEC:  # tap a tile = open its page
+                state.update(focused=item, focused_at=time.monotonic(),
+                             focused_ask="")
+                repaint(deck, state, n, nav_key)
+                wake.set()
+                return
+        if item and item["handle"]:             # hold a tile = interrupt, as before
+            run(interrupt_terminal, item["handle"], item.get("env"))
 
     deck.set_key_callback(on_press)
 
     pulse_on = False
+    last_count = 0      # needs-you count from the previous poll, for the 0 -> N jump
     try:
         while True:
             items = fetch_items()
@@ -570,7 +857,14 @@ def main():
                     continue
 
                 state["items"] = items
-                count = repaint(deck, state, n, nav_key)
+                refresh_focus(state, items)
+                count = sum(1 for it in items if it["state"] in NEEDS_HUMAN)
+                # Nothing needed you a moment ago and now something does: go to it,
+                # rather than leaving you to hunt for which page it's on.
+                if count and not last_count and not state["focused"]:
+                    state["page"] = page_of(items, n, urgent_first(items))
+                last_count = count
+                repaint(deck, state, n, nav_key)
                 deck.set_brightness(PULSE[pulse_on] if count else DIM_BRIGHTNESS)
 
             wake.wait(POLL_SECONDS)
