@@ -116,18 +116,27 @@ load -w ~/Library/LaunchAgents/com.taek.orca-menubar.plist`.
 
 The badge counts the window down, because the point of a window is knowing it's
 closing. The menu bar app has the same three durations as a submenu (click the
-checked one to turn it off). Or run it standalone, no expiry:
+checked one to turn it off).
+
+**The daemon is not part of the deck.** It runs under its own LaunchAgent and
+reads `~/.orca-streamdeck-armed` every poll; arming from the deck or menu bar
+only *writes that file*. So a wedged USB port, a crashed deck, or no Stream Deck
+at all makes no difference to whether codex gets answered:
 
 ```sh
-./.venv/bin/python orca_autoapprove.py
+cp com.taek.orca-autoapprove.plist ~/Library/LaunchAgents/ \
+  && launchctl load -w ~/Library/LaunchAgents/com.taek.orca-autoapprove.plist
 ```
 
+It was a child process of the deck once. Then Elgato's app grabbed the USB back,
+the deck crash-looped, and blind approval died with it — while the arm file still
+said `Forever` and nobody was watching. A remote control must not be life support
+for the thing it controls. Disarmed it makes no `orca` calls at all; run it by
+hand with `--always` to ignore the arm file entirely.
+
 Timed windows exist because blind approval is a mode you will forget you left on
-— `Forever` is there when you mean it. The deadline is written to
-`~/.orca-streamdeck-armed`, so a deck crash (launchd restarts it) comes back
-armed rather than silently dropping to off, while a lapsed window can't be
-resurrected. Arming also `pkill`s any other auto-approver first: two of them
-would each press Enter on the same modal.
+— `Forever` is there when you mean it. A lapsed window can't be resurrected, but
+`Forever` survives crashes and reboots, since an infinite deadline never passes.
 
 Watches every **codex** agent in the fleet and presses Enter on its approval
 modals, so codex never sits blocked. Codex has a family of them — exec, edits,
@@ -232,5 +241,6 @@ Offline checks for urgency order, pagination, and the agent→terminal
 - `orca_cleanup.py` — finished-worktree report and cleanup (see above)
 - `orca_autoapprove.py` — opt-in codex approval auto-presser (see above)
 - `run.sh` — Stream Deck launcher (device handoff, launchd-safe PATH/dyld)
-- `com.taek.orca-streamdeck.plist` / `com.taek.orca-menubar.plist` — LaunchAgents
+- `com.taek.orca-streamdeck.plist` / `com.taek.orca-menubar.plist` /
+  `com.taek.orca-autoapprove.plist` — LaunchAgents
 - `test_orca_streamdeck.py` — offline checks
