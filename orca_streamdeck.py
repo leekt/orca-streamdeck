@@ -7,9 +7,9 @@ status key: shows how many agents need you, and cycles pages when there are more
 agents than keys. The deck dims when nothing needs you and pulses when something
 does. (Orca sends its own notifications, so this doesn't duplicate them.)
 
-Tap a tile   -> focus that agent's terminal in Orca (and raise the app).
-Hold a tile  -> interrupt that agent (Esc/Ctrl-C to its terminal). Interrupting
-                is always safe; there is deliberately no per-agent approve key.
+Tap a tile   -> open that agent's page: focus / approve / trust / interrupt /
+                diffs, with Back on the status key.
+Hold a tile  -> interrupt that agent (Esc/Ctrl-C to its terminal).
 Hold status  -> cycle orca_autoapprove.py, which blind-approves every codex modal
                 fleet-wide: off -> 30m -> 1h -> forever -> off. The key shows an
                 amber badge counting the window down ("AUTO 24m" / "AUTO ON").
@@ -42,8 +42,6 @@ PULSE = (60, 100)           # brightness pulse endpoints when attention needed
 # --- Project-group features (all default OFF: the pane stays urgency-flat with
 # no group visuals until you turn one on). Orca groups repos via projectGroupId. ---
 GROUP_ACCENT = False        # draw a per-group color stripe down the left of each tile
-GROUP_FILTER = None         # a repo displayName; show only agents in THAT repo's group
-GROUP_PAGES = False         # one group per page instead of urgency-flat pagination
 
 # --- Remote machines: Orca pairs with other runtimes (`orca environment list`),
 # and every CLI command takes --environment. Each paired machine is polled next to
@@ -263,12 +261,8 @@ def fetch_env_items(env=None):
     terms = (_orca_json(["terminal", "list", "--json"], env) or {}).get("terminals", [])
     # Only pay for the repo-list query when a group feature needs it (identicons
     # come straight from the repo name, which worktree ps already carries).
-    by_id, by_name = fetch_repo_groups(env) if (GROUP_ACCENT or GROUP_FILTER or GROUP_PAGES) else ({}, {})
-    items = build_items(wt.get("worktrees", []), terms, by_id, env)
-    if GROUP_FILTER:
-        target = by_name.get(GROUP_FILTER)
-        items = [it for it in items if it.get("group") == target]
-    return items
+    by_id, _ = fetch_repo_groups(env) if GROUP_ACCENT else ({}, {})
+    return build_items(wt.get("worktrees", []), terms, by_id, env)
 
 
 def fetch_items():
@@ -294,23 +288,6 @@ def paginate(items, key_count):
     pages = [items[i:i + per] for i in range(0, len(items), per)] or [[]]
     return pages
 
-
-def paginate_grouped(items, key_count):
-    """Like paginate, but never mixes groups on a page. Groups appear in order of
-    their most-urgent agent (items arrive urgency-sorted)."""
-    per = max(1, key_count - 1)
-    order, buckets = [], {}
-    for it in items:
-        g = it.get("group")
-        if g not in buckets:
-            buckets[g] = []
-            order.append(g)
-        buckets[g].append(it)
-    pages = []
-    for g in order:
-        b = buckets[g]
-        pages += [b[i:i + per] for i in range(0, len(b), per)]
-    return pages or [[]]
 
 
 # --- Actions ---------------------------------------------------------------
@@ -654,7 +631,7 @@ def repaint(deck, state, n, nav_key):
             deck.set_key_image(k, img)
         return count
 
-    pages = paginate_grouped(items, n) if GROUP_PAGES else paginate(items, n)
+    pages = paginate(items, n)
     page = state["page"] % len(pages)
     page_items = pages[page]
     badge = auto_badge(state["auto_until"] if alive else None, now)
@@ -701,7 +678,7 @@ def page_of(items, key_count, item):
     """Which page an item lands on, so the deck can jump straight there."""
     if not item:
         return 0
-    pages = paginate_grouped(items, key_count) if GROUP_PAGES else paginate(items, key_count)
+    pages = paginate(items, key_count)
     for i, page in enumerate(pages):
         if any(it["id"] == item["id"] for it in page):
             return i
