@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.taek.orca-autoapprove</string>
+
+  <!-- Runs always; acts only while ~/.orca-streamdeck-armed says to. Kept out of
+       the Stream Deck process on purpose: a USB failure there must not take
+       blind approval down with it. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/taek/orca/projects/orca-streamdeck/.venv/bin/python</string>
+    <string>-u</string>
+    <string>/Users/taek/orca/projects/orca-streamdeck/orca_autoapprove.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/taek/orca/projects/orca-streamdeck</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/taek/Library/Logs/orca-autoapprove.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/taek/Library/Logs/orca-autoapprove.log</string>
+</dict>
+</plist>

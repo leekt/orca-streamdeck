@@ -335,11 +335,12 @@ def open_changed(worktree_id, env=None):
             subprocess.Popen(["open", "-a", "Orca"])
 
 
-# ponytail: run the auto-approver as a child process rather than importing it —
-# it imports this module, so in-process would mean an import cycle. Its log lines
-# land in the deck's own log, and it dies with the deck.
-AUTO_APPROVE_CMD = [sys.executable, "-u",
-                    str(pathlib.Path(__file__).with_name("orca_autoapprove.py"))]
+# The auto-approver is NOT a child of this process. It runs under its own
+# LaunchAgent and reads ARMED_FILE every poll; arming here only writes that file.
+# It used to be a child — until Elgato's app grabbed the USB back, the deck
+# crash-looped, and blind approval died with it while nobody was watching. A
+# remote control must not be life support for the thing it controls.
+#
 # How long a single arming lasts. None = until you disarm it; the deck's status
 # key cycles off -> 30m -> 1h -> forever -> off, so the timed options stay the
 # ones you reach first — blind approval is a mode you WILL forget you left on.
@@ -354,51 +355,40 @@ def duration_label(minutes):
         f"{minutes} min" if minutes < 60 else f"{minutes // 60} hour")
 
 
-def disarm_autoapprove(proc):
-    """Stop the auto-approver and forget the deadline. Returns (None, None)."""
-    if proc and proc.poll() is None:
-        proc.terminate()
+def disarm_autoapprove():
+    """Stand the auto-approver down. Returns (None, None) for (expiry, scope)."""
     ARMED_FILE.unlink(missing_ok=True)
     return None, None
 
 
-def arm_autoapprove(proc, minutes, now, idx=0, only=None):
-    """Run the codex auto-approver for `minutes` (None = forever), optionally
-    scoped to a single terminal handle. Returns (process, expiry epoch).
-
-    The deadline is written to disk so a deck crash (launchd restarts us) comes
-    back armed instead of silently dropping to off — but a timed window can't be
-    resurrected once it has passed. Any other auto-approver is killed first: two
-    of them would each press Enter on the same modal."""
-    disarm_autoapprove(proc)
-    subprocess.run(["pkill", "-f", "orca_autoapprove.py"], capture_output=True)
+def arm_autoapprove(minutes, now, idx=0, only=None):
+    """Arm for `minutes` (None = forever), optionally scoped to one terminal
+    handle. Returns (expiry epoch, scope). Writing the file IS the arming — the
+    daemon picks it up on its next poll, whether or not this deck survives."""
     until = FOREVER if minutes is None else now + minutes * 60
-    # A scoped arming is deliberately NOT persisted: resuming "trust one agent"
-    # after a restart would re-target a handle that may no longer exist.
-    if only:
-        return subprocess.Popen([*AUTO_APPROVE_CMD, "--only", only]), until
-    ARMED_FILE.write_text(f"{until} {idx}")
-    return subprocess.Popen(AUTO_APPROVE_CMD), until
+    ARMED_FILE.write_text(f"{until} {idx} {only}" if only else f"{until} {idx}")
+    return until, only
 
 
-def cycle_autoapprove(proc, idx, now):
+def cycle_autoapprove(idx, now):
     """What holding the status key does: step to the next duration, wrapping back
-    to off after the last one. Returns (process, expiry, duration index)."""
+    to off after the last one. Returns (expiry, scope, duration index)."""
     idx = -1 if idx >= len(AUTO_DURATIONS) - 1 else idx + 1
     if idx < 0:
-        return (*disarm_autoapprove(proc), idx)
-    return (*arm_autoapprove(proc, AUTO_DURATIONS[idx], now, idx), idx)
+        return (*disarm_autoapprove(), idx)
+    return (*arm_autoapprove(AUTO_DURATIONS[idx], now, idx), idx)
 
 
 def armed_state(now):
-    """(expiry, duration index) left by a previous run, or None if it has lapsed
-    or was never set."""
+    """(expiry, duration index, scoped handle or None), or None when disarmed or
+    lapsed. The single source of truth for whether anything is auto-approving."""
     try:
-        until, idx = ARMED_FILE.read_text().split()
-        until, idx = float(until), int(idx)
-    except (OSError, ValueError):
+        parts = ARMED_FILE.read_text().split()
+        until, idx = float(parts[0]), int(parts[1])
+        only = parts[2] if len(parts) > 2 else None
+    except (OSError, ValueError, IndexError):
         return None
-    return (until, idx) if until > now else None
+    return (until, idx, only) if until > now else None
 
 
 # --- Rendering -------------------------------------------------------------
@@ -620,13 +610,11 @@ def repaint(deck, state, n, nav_key):
     items = state["items"]
     now = time.time()
     count = sum(1 for it in items if it["state"] in NEEDS_HUMAN)
-    p = state["auto"]
-    alive = bool(p and p.poll() is None)        # False again if it died on its own
-
+    armed = armed_state(now)                    # the daemon's own source of truth
     if state["focused"]:                        # drilled into one agent
         for k, img in render_agent_page(deck, state["focused"], n, nav_key,
                                         state["focused_ask"],
-                                        state["auto_only"] if alive else None,
+                                        armed[2] if armed else None,
                                         now * 1000).items():
             deck.set_key_image(k, img)
         return count
@@ -634,7 +622,7 @@ def repaint(deck, state, n, nav_key):
     pages = paginate(items, n)
     page = state["page"] % len(pages)
     page_items = pages[page]
-    badge = auto_badge(state["auto_until"] if alive else None, now)
+    badge = auto_badge(armed[0] if armed else None, now)
     # Worst state in the fleet washes the empty keys — only when it's something
     # you'd want to notice, so a calm fleet stays dark.
     worst = min((STATUS.get(it["state"], DEFAULT) for it in items),
@@ -724,13 +712,12 @@ def agent_action(state, act, item, held, run):
         run(deny_terminal if held >= LONG_PRESS_SEC else send_to_terminal_enter,
             handle, env)
     elif act == "auto":
-        if state["auto_only"] == handle:        # already trusting this one -> stop
-            proc, until = disarm_autoapprove(state["auto"])
-            return {"auto": proc, "auto_until": until, "auto_only": None}
-        proc, until = arm_autoapprove(state["auto"], AUTO_DURATIONS[0],
-                                      time.time(), 0, only=handle)
-        return {"auto": proc, "auto_until": until, "auto_only": handle,
-                "auto_idx": -1}                 # scoped, so not a fleet duration
+        armed = armed_state(time.time())
+        if armed and armed[2] == handle:        # already trusting this one -> stop
+            disarm_autoapprove()
+            return {"auto_idx": -1}
+        arm_autoapprove(AUTO_DURATIONS[0], time.time(), 0, only=handle)
+        return {"auto_idx": -1}                 # scoped, so not a fleet duration
     return {}
 
 
@@ -752,21 +739,19 @@ def main():
 
     lock = threading.Lock()
     wake = threading.Event()
-    # slots[k] = item or None; auto = the auto-approver child, auto_until its
-    # expiry, auto_idx which AUTO_DURATIONS entry is active (-1 = off)
+    # slots[k] = item or None; auto_idx = which AUTO_DURATIONS entry the status
+    # key last selected (-1 = off). The armed window itself lives in ARMED_FILE.
     state = {"page": 0, "pages": 1, "slots": [None] * n, "items": [],
-             "auto": None, "auto_until": None, "auto_idx": -1, "auto_only": None,
+             "auto_idx": -1,
              # focused = the agent whose page is open; focused_ask = what it's
              # waiting on, refreshed by the poll loop while that page is up
              "focused": None, "focused_at": 0.0, "focused_ask": ""}
     press_at = {}  # key -> monotonic time of key-down
 
-    resumed = armed_state(time.time())          # armed when the deck last died?
-    if resumed:
-        state["auto"] = subprocess.Popen(AUTO_APPROVE_CMD)
-        state["auto_until"], state["auto_idx"] = resumed
-        print("Resumed codex auto-approve "
-              f"({auto_badge(state['auto_until'], time.time()) or 'off'})")
+    resumed = armed_state(time.time())
+    if resumed:                                 # the daemon is already acting on it
+        state["auto_idx"] = resumed[1]
+        print(f"Codex auto-approve is {auto_badge(resumed[0], time.time())}")
 
     def on_press(_deck, key, pressed):
         if pressed:
@@ -789,10 +774,8 @@ def main():
 
             if key == nav_key:                  # --- fleet: status key ---
                 if held >= LONG_PRESS_SEC:      # hold = next auto-approve duration
-                    (state["auto"], state["auto_until"],
-                     state["auto_idx"]) = cycle_autoapprove(
-                        state["auto"], state["auto_idx"], time.time())
-                    state["auto_only"] = None
+                    *_, state["auto_idx"] = cycle_autoapprove(
+                        state["auto_idx"], time.time())
                 elif state["pages"] > 1:
                     state["page"] = (state["page"] + 1) % state["pages"]
                 repaint(deck, state, n, nav_key)   # don't wait for the next poll
@@ -819,11 +802,6 @@ def main():
             pulse_on = not pulse_on
 
             with lock:
-                if state["auto_until"] and time.time() >= state["auto_until"]:
-                    state["auto"], state["auto_until"] = disarm_autoapprove(state["auto"])
-                    state["auto_idx"] = -1              # window's up (never for FOREVER)
-                    print("Codex auto-approve expired")
-
                 if items is None:
                     state.update(page=0, pages=1, slots=[None] * n, items=[])
                     for k in range(n):
@@ -849,10 +827,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        if state["auto"]:
-            # Orphan nothing — but leave ARMED_FILE alone: if launchd restarts us
-            # inside the window we come back armed.
-            state["auto"].terminate()
+        # Nothing to tear down: the auto-approver is not ours to kill, and the
+        # armed window must outlive us.
         deck.reset()
         deck.close()
 

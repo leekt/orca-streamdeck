@@ -343,6 +343,23 @@ def _restore():
     m.ARMED_FILE = _REAL_ARMED_FILE
 
 
+def test_every_start_kills_any_other_daemon():
+    """Two auto-approvers each press Enter on the same modal. The resume path
+    used to spawn directly and skip this guard, so restarts stacked them up."""
+    killed, spawned = [], _fake_procs()
+    m.subprocess.run = lambda cmd, **k: killed.append(cmd)
+    try:
+        m.spawn_autoapprove()
+        assert killed == [["pkill", "-f", "orca_autoapprove.py"]]
+        assert spawned[-1] == m.AUTO_APPROVE_CMD
+        m.arm_autoapprove(None, 30, 1000.0)          # the armed path guards too
+        assert len(killed) == 2
+        m.spawn_autoapprove(only="h")
+        assert spawned[-1][-2:] == ["--only", "h"] and len(killed) == 3
+    finally:
+        _restore()
+
+
 def test_arm_autoapprove_persists_a_deadline_that_expires():
     spawned = _fake_procs()
     try:

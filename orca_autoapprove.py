@@ -11,7 +11,14 @@ It approves EVERYTHING codex asks: shell commands, file writes, network calls,
 tool calls — no human in the loop. Claude agents are left alone. Run it only
 where you'd be fine with codex's own `--dangerously-bypass-approvals-and-sandbox`.
 
-Run: ./.venv/bin/python orca_autoapprove.py
+Runs continuously under its own LaunchAgent and acts only while something has
+armed it in ~/.orca-streamdeck-armed — the deck's status key, the menu bar, or
+you. Disarmed, it makes no orca calls at all. Being independent is the whole
+point: it used to be a child of the Stream Deck process, so when Elgato's app
+grabbed the USB back and the deck crash-looped, blind approval died with it
+while nobody was watching.
+
+Run: ./.venv/bin/python orca_autoapprove.py --always   # ignore the arm file
 
 Author: taek <leekt216@gmail.com>
 """
@@ -72,9 +79,32 @@ def poll(sent_at, now):
     return fresh
 
 
+IDLE_SECONDS = 5.0    # how often to re-check the arm file while stood down
+
+
 def main():
-    sent_at = {}
+    """Run forever; act only while ARMED_FILE says to.
+
+    The deck and menu bar arm this by writing that file, not by spawning us — so
+    a crashed deck (or no deck at all) can't take blind approval down with it.
+    `--always` ignores the file, for running this by hand."""
+    always = "--always" in sys.argv
+    sent_at, was_armed = {}, None
     while True:
+        armed = core.armed_state(time.time())
+        if not (always or armed):
+            if was_armed:
+                print("stood down", flush=True)
+                was_armed, sent_at = False, {}
+            time.sleep(IDLE_SECONDS)    # no orca calls at all while disarmed
+            continue
+        if not was_armed:
+            scope = f" for {armed[2]}" if armed and armed[2] else " fleet-wide"
+            print(f"armed{scope}", flush=True)
+            was_armed = True
+        # A scope in the file beats the command line; the deck owns it at runtime.
+        global ONLY
+        ONLY = {armed[2]} if (armed and armed[2]) else (ONLY if always else set())
         for _, what in poll(sent_at, time.monotonic()):
             print(f"approved {what}", flush=True)
         time.sleep(core.POLL_SECONDS)

@@ -12,7 +12,6 @@ Run: ./.venv/bin/python orca_menubar.py
 
 Author: taek <leekt216@gmail.com>
 """
-import atexit
 import threading
 import time
 
@@ -29,30 +28,22 @@ class OrcaBar(rumps.App):
     def __init__(self):
         super().__init__(IDLE_TITLE, quit_button="Quit")
         self._sig = None
-        self._auto, self._auto_until, self._auto_idx = None, None, -1
-        atexit.register(self._stop_auto)     # never outlive the app
+        self._auto_idx = -1
         rumps.Timer(self.refresh, core.POLL_SECONDS).start()
 
     def _act(self, fn, *args):
         # Run the orca call off the UI thread so the menu stays responsive.
         return lambda _: threading.Thread(target=fn, args=args, daemon=True).start()
 
-    @property
-    def _auto_on(self):
-        return bool(self._auto and self._auto.poll() is None)
-
-    def _stop_auto(self):
-        self._auto, self._auto_until = core.disarm_autoapprove(self._auto)
-        self._auto_idx = -1
-
     def _pick_auto(self, idx):
-        """Choose a duration — or turn it off by picking the one already running."""
+        """Choose a duration — or turn it off by picking the one already armed.
+        Arming is just a file write; the daemon runs on its own."""
         def chosen(_):
-            if self._auto_on and self._auto_idx == idx:
-                self._stop_auto()
+            if core.armed_state(time.time()) and self._auto_idx == idx:
+                core.disarm_autoapprove()
+                self._auto_idx = -1
             else:
-                self._auto, self._auto_until = core.arm_autoapprove(
-                    self._auto, core.AUTO_DURATIONS[idx], time.time(), idx)
+                core.arm_autoapprove(core.AUTO_DURATIONS[idx], time.time(), idx)
                 self._auto_idx = idx
             self._sig = None        # force a rebuild so the checkmark updates
         return chosen
@@ -71,10 +62,11 @@ class OrcaBar(rumps.App):
         self.title = f"🔴 {count}" if count else IDLE_TITLE
 
         # Only rebuild the menu when the agent set/states change — avoids
-        # closing a submenu the user is navigating every 2s. Auto-approve expiring
-        # on its own counts as a change, hence it's in the signature.
-        if self._auto_until and time.time() >= self._auto_until:
-            self._stop_auto()
+        # closing a submenu the user is navigating every 2s. Auto-approve lapsing
+        # counts as a change, hence it's in the signature.
+        armed = core.armed_state(time.time())
+        if not armed:
+            self._auto_idx = -1
         sig = tuple((it["id"], it["state"]) for it in items) + (self._auto_idx,)
         if sig == self._sig:
             return
@@ -99,11 +91,11 @@ class OrcaBar(rumps.App):
         if not items:
             self.menu.add("No agents")
         self.menu.add(rumps.separator)
-        left = core.auto_badge(self._auto_until if self._auto_on else None, time.time())
+        left = core.auto_badge(armed[0] if armed else None, time.time())
         auto = rumps.MenuItem(f"Codex auto-approve{'  · ' + left[5:] if left else ''}")
         for i, minutes in enumerate(core.AUTO_DURATIONS):
             item = rumps.MenuItem(core.duration_label(minutes), callback=self._pick_auto(i))
-            item.state = 1 if self._auto_on and self._auto_idx == i else 0
+            item.state = 1 if armed and self._auto_idx == i else 0
             auto.add(item)
         self.menu.add(auto)
 
