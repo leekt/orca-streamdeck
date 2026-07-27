@@ -283,15 +283,18 @@ def test_poll_presses_enter_only_for_blocked_codex_and_rate_limits_retries():
     auto.approve = lambda h, env=None: sent.append(h)
 
     at = {}
-    first = auto.poll(at, 100.0)
-    assert _handles(first) == ["c"] and sent == ["c"]        # claude never touched
-    assert first[0][1].startswith("web: ")                   # log line names the repo
-    assert reads == ["c"]        # unflagged terminals are never even read
-    assert auto.poll(at, 101.0) == [] and sent == ["c"]      # inside the retry window
-    # still flagged with a modal after the window -> codex asked again, press again
-    assert _handles(auto.poll(at, 100.0 + auto.RETRY_SECONDS)) == ["c"]
-    items[0]["title"] = BUSY_TITLE
-    assert auto.poll(at, 200.0) == [] and sent == ["c", "c"]  # unblocked -> quiet
+    try:
+        first = auto.poll(at, 100.0)
+        assert _handles(first) == ["c"] and sent == ["c"]        # claude never touched
+        assert first[0][1].startswith("web: ")                   # log line names the repo
+        assert reads == ["c"]        # unflagged terminals are never even read
+        assert auto.poll(at, 101.0) == [] and sent == ["c"]      # inside the retry window
+        # still flagged with a modal after the window -> codex asked again, press again
+        assert _handles(auto.poll(at, 100.0 + auto.RETRY_SECONDS)) == ["c"]
+        items[0]["title"] = BUSY_TITLE
+        assert auto.poll(at, 200.0) == [] and sent == ["c", "c"]  # unblocked -> quiet
+    finally:
+        m.fetch_items = _REAL_FETCH_ITEMS
 
 
 def test_poll_honours_the_repo_allowlist():
@@ -307,10 +310,13 @@ def test_poll_honours_the_repo_allowlist():
         assert _handles(auto.poll({}, 100.0)) == ["c"]   # prod is off limits
     finally:
         auto.REPOS = None
+        m.fetch_items = _REAL_FETCH_ITEMS
 
 
 _REAL_POPEN, _REAL_RUN = m.subprocess.Popen, m.subprocess.run
 _REAL_ENVS, _REAL_ENV_ITEMS = m.fetch_environments, m.fetch_env_items
+_REAL_READ_TAIL = m.read_tail
+_REAL_FETCH_ITEMS = m.fetch_items
 _REAL_ARMED_FILE = m.ARMED_FILE
 _TMP_ARMED = m.pathlib.Path(__file__).with_name(".armed-test")
 
@@ -404,6 +410,114 @@ def test_auto_badge_counts_the_window_down():
 def test_duration_label_reads_naturally():
     assert [m.duration_label(d) for d in m.AUTO_DURATIONS] == \
         ["30 min", "1 hour", "Forever"]
+
+
+def _agent(id="A", handle="h", state="waiting", **kw):
+    base = {"id": id, "handle": handle, "state": state, "repo": "web",
+            "agent_type": "codex", "title": BLOCKED_TITLE, "pinned": False,
+            "last_output": 1, "worktree_id": "R::/p", "env": None}
+    return {**base, **kw}
+
+
+def test_ask_label_fits_a_key():
+    assert m.ask_label("Would you like to run the following command — gh pr") == "command"
+    assert m.ask_label("Would you like to make the following edits") == "edits"
+    assert m.ask_label("Would you like to grant these permissions") == "perms"
+    assert m.ask_label("Do you want to approve network access to") == "network"
+    assert m.ask_label("gh pr list") == "approve?"     # exec modal, no header
+
+
+def test_action_state_disables_what_cannot_run():
+    it = _agent()
+    assert m.action_state("approve", it, "edits", None) == ("edits", True)
+    assert m.action_state("approve", it, "", None) == ("nothing", False)  # no modal
+    assert m.action_state("auto", it, "", "h") == ("on", True)            # scoped here
+    assert m.action_state("auto", it, "", None) == ("this one", True)
+    assert m.action_state("auto", _agent(agent_type="claude"), "", None)[1] is False
+    assert m.action_state("interrupt", _agent(handle=None), "", None)[1] is False
+    assert m.action_state("diffs", _agent(worktree_id=None), "", None)[1] is False
+
+
+def test_urgent_first_and_page_of_find_the_thing_that_needs_you():
+    calm = [_agent(id=str(i), state="done") for i in range(7)]
+    assert m.urgent_first(calm) is None                 # nothing to jump to
+    urgent = _agent(id="X", state="permission")
+    items = sorted(calm + [urgent], key=m.urgency_key)
+    assert m.urgent_first(items)["id"] == "X"
+    # a stopped agent outranks one merely waiting
+    stopped = _agent(id="S", state="interrupted")
+    assert m.urgent_first(sorted(items + [stopped], key=m.urgency_key))["id"] == "S"
+    # and we can find which page it sits on (6 keys -> 5 tiles per page)
+    tail_urgent = [_agent(id=str(i), state="done") for i in range(5)] + [urgent]
+    assert m.page_of(tail_urgent, 6, urgent) == 1
+    assert m.page_of(tail_urgent, 6, None) == 0
+
+
+def test_refresh_focus_rebinds_drops_and_expires():
+    m.read_tail = lambda h, env=None: "Would you like to make the following edits?"
+    try:
+        st = {"focused": _agent(state="waiting"), "focused_at": m.time.monotonic(),
+              "focused_ask": ""}
+        m.refresh_focus(st, [_agent(state="permission")])
+        assert st["focused"]["state"] == "permission"   # re-bound to fresh data
+        assert st["focused_ask"] == "edits"             # and what it's asking
+
+        m.refresh_focus(st, [])                         # agent vanished
+        assert st["focused"] is None and st["focused_ask"] == ""
+
+        st = {"focused": _agent(), "focused_ask": "edits",
+              "focused_at": m.time.monotonic() - m.AGENT_PAGE_IDLE - 1}
+        m.refresh_focus(st, [_agent()])                 # idle too long
+        assert st["focused"] is None
+    finally:
+        m.read_tail = _REAL_READ_TAIL
+
+
+def test_agent_action_routes_taps_and_holds():
+    calls = []
+    run = lambda fn, *a: calls.append((fn.__name__, a))
+    it = _agent(env="mac mini")
+    st = {"auto": None, "auto_until": None, "auto_only": None}
+
+    assert m.agent_action(st, "focus", it, 0, run) == {"focused": None}
+    assert calls[-1] == ("focus_terminal", ("h", "mac mini"))
+    m.agent_action(st, "interrupt", it, 0, run)
+    assert calls[-1] == ("interrupt_terminal", ("h", "mac mini"))
+    m.agent_action(st, "approve", it, 0, run)                    # tap = yes
+    assert calls[-1][0] == "send_to_terminal_enter"
+    m.agent_action(st, "approve", it, m.LONG_PRESS_SEC, run)     # hold = no
+    assert calls[-1] == ("deny_terminal", ("h", "mac mini"))
+    m.agent_action(st, "diffs", it, 0, run)
+    assert calls[-1] == ("open_changed", ("R::/p", "mac mini"))
+
+
+def test_agent_action_auto_scopes_to_one_handle_and_toggles_off():
+    spawned = _fake_procs()
+    try:
+        st = {"auto": None, "auto_until": None, "auto_only": None}
+        st.update(m.agent_action(st, "auto", _agent(), 0, lambda *a: None))
+        assert st["auto_only"] == "h" and st["auto_idx"] == -1
+        assert spawned[0][-2:] == ["--only", "h"]      # daemon told to trust one
+        assert not m.ARMED_FILE.exists()               # scoped arming isn't resumed
+
+        st.update(m.agent_action(st, "auto", _agent(), 0, lambda *a: None))
+        assert st["auto_only"] is None and st["auto"] is None   # pressing again stops
+    finally:
+        _restore()
+
+
+def test_autoapprove_only_flag_narrows_to_one_terminal():
+    auto.core.fetch_items = lambda: [
+        _agent(id="1", handle="mine"), _agent(id="2", handle="other")]
+    auto.read_tail = lambda h, env=None: PROMPT
+    sent = []
+    auto.approve = lambda h, env=None: sent.append(h)
+    auto.ONLY = {"mine"}
+    try:
+        assert _handles(auto.poll({}, 100.0)) == ["mine"]
+    finally:
+        auto.ONLY = set()
+        m.fetch_items = _REAL_FETCH_ITEMS
 
 
 if __name__ == "__main__":
