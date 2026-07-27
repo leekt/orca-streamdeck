@@ -29,11 +29,41 @@ and a **macOS menu bar app** (`orca_menubar.py`) — use either or both.
   through 30m / 1h / forever / off (amber countdown badge — see below).
 - Deck **pulses bright** when something needs you. (Orca sends its own
   notifications, so this doesn't add duplicate alerts.)
-- **Tap** a tile → focus that agent's terminal in Orca (raises the app).
-- **Hold** a tile (≥0.7s) → interrupt that agent (Esc/Ctrl-C to its terminal).
-  Interrupting is always safe; there is deliberately **no blind "approve"** key —
-  tap-to-jump is the approve path. (If you do want blind approval for codex, it
-  lives in a separate opt-in daemon — see below.)
+- **Tap** a tile → open that agent's **page** (below). **Hold** → interrupt it.
+- The **empty keys glow** with the fleet's worst state, so the unit reads from
+  across the room instead of needing you to read 80px tiles. A calm fleet stays
+  dark — the wash only appears for stopped/needs-you.
+- When the needs-you count goes **0 → N**, the deck **jumps to the page** holding
+  the most urgent agent, rather than leaving you to find which page it's on.
+
+## Agent page
+
+Tapping a tile drills into one agent. The status key becomes **Back**, and the
+page falls back to the fleet after 30s idle.
+
+```
+┌───────┬───────┬───────┐
+│ FOCUS │ APPRV │ AUTO  │   APPRV: tap = Enter, hold = Esc (deny)
+├───────┼───────┼───────┤   AUTO:  auto-approve THIS agent for 30m
+│ INTR  │ DIFFS │ BACK  │   DIFFS: open its changed files as diffs
+└───────┴───────┴───────┘
+```
+
+- **APPRV** shows what the agent is actually asking (`command`, `edits`, `perms`,
+  `network`, `tool`) and is greyed out when there's nothing pending. Tap approves
+  that one modal; hold sends Esc, which codex maps to *"No, and tell Codex what to
+  do differently"* — a refusal, not a kill.
+- **AUTO** scopes the auto-approver to this single terminal (`--only <handle>`),
+  so "trust this agent" doesn't mean "trust the fleet". Press again to stop. A
+  scoped arming is deliberately **not** persisted across restarts — resuming it
+  would re-target a handle that may no longer exist.
+- Keys grey out when they can't act (no terminal, no worktree, not a codex agent).
+- Closing a terminal is deliberately **not** on this page. It's one keypress from
+  a tile, and it's unrecoverable.
+
+Everything here is per-agent and deliberate; *blind* fleet-wide approval is the
+separate opt-in daemon below. Actions carry the agent's machine, so the page
+works the same for a remote agent.
 
 Adapts to any model (Mini/MK.2/XL/Plus/Plus XL): key count, image size and fonts
 come from the device. Dials/touch strips (Plus/Plus XL) aren't used yet.
