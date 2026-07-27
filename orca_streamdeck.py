@@ -9,7 +9,10 @@ does. (Orca sends its own notifications, so this doesn't duplicate them.)
 
 Tap a tile   -> focus that agent's terminal in Orca (and raise the app).
 Hold a tile  -> interrupt that agent (Esc/Ctrl-C to its terminal). Interrupting
-                is always safe; there is deliberately no blind "approve" button.
+                is always safe; there is deliberately no per-agent approve key.
+Hold status  -> cycle orca_autoapprove.py, which blind-approves every codex modal
+                fleet-wide: off -> 30m -> 1h -> forever -> off. The key shows an
+                amber badge counting the window down ("AUTO 24m" / "AUTO ON").
 
 Works on any model (Mini/MK.2/XL/Plus/...) — key count, image size and fonts are
 derived from the connected device. Screenless decks (Pedal) are not supported.
@@ -17,10 +20,13 @@ derived from the connected device. Screenless decks (Pedal) are not supported.
 Author: taek <leekt216@gmail.com>
 """
 import colorsys
+import concurrent.futures
 import functools
 import hashlib
 import json
+import pathlib
 import subprocess
+import sys
 import threading
 import time
 
@@ -39,10 +45,16 @@ GROUP_ACCENT = False        # draw a per-group color stripe down the left of eac
 GROUP_FILTER = None         # a repo displayName; show only agents in THAT repo's group
 GROUP_PAGES = False         # one group per page instead of urgency-flat pagination
 
+# --- Remote machines: Orca pairs with other runtimes (`orca environment list`),
+# and every CLI command takes --environment. Each paired machine is polled next to
+# the local one, so one pane covers the whole fleet wherever it runs. ---
+INCLUDE_REMOTES = True
+REMOTE_TIMEOUT = 8          # a sleeping mac mini must not stall the pane
+
 # --- Per-project icons: an auto-generated identicon derived from the repo name,
 # distinct per project (no network, no external avatars). ---
 SHOW_ICONS = True
-_ICON_CACHE = {}            # repo name -> base identicon PIL.Image (RGBA)
+_ICON_CACHE = {}            # env:repo -> base identicon PIL.Image (RGBA)
 
 
 def group_color(group_id):
@@ -76,8 +88,9 @@ def _identicon(name, size):
 
 
 def icon_image(item, size):
-    """Sized identicon for a tile, cached by repo name."""
-    name = item.get("repo", "?")
+    """Sized identicon for a tile, cached per machine+repo — the same repo checked
+    out on two machines has to look different, since both can be on screen."""
+    name = f"{item.get('env') or ''}:{item.get('repo', '?')}"
     if name not in _ICON_CACHE:
         _ICON_CACHE[name] = _identicon(name, 128)
     return _ICON_CACHE[name].resize((size, size))
@@ -95,6 +108,19 @@ STATUS = {
 }
 DEFAULT = (6, (90, 90, 90), "")
 NEEDS_HUMAN = {"permission", "waiting"}
+
+
+def age_label(ms, now_ms):
+    """Compact time since an agent last said anything: 45s / 12m / 4h / 2d. Blank
+    when it never spoke. Without this every 'done' tile looks equally fresh, and
+    the one you abandoned an hour ago hides among the ones that just finished."""
+    if not ms:
+        return ""
+    secs = max(0, int(now_ms) - int(ms)) // 1000    # now_ms is a float clock
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{secs // size}{unit}"
+    return f"{secs}s"
 
 
 def text_color(bg):
@@ -119,22 +145,50 @@ def load_font(size):
 
 # --- Orca queries ----------------------------------------------------------
 
-def _orca_json(args):
+def _orca_cmd(args, env):
+    """`orca ...`, aimed at a paired machine when env is set (None = this one)."""
+    return ["orca", *args] + (["--environment", env] if env else [])
+
+
+def _orca_json(args, env=None):
     try:
-        out = subprocess.run(["orca", *args], capture_output=True, text=True, timeout=15)
+        out = subprocess.run(_orca_cmd(args, env), capture_output=True, text=True,
+                             timeout=REMOTE_TIMEOUT if env else 15)
         data = json.loads(out.stdout)
         return data.get("result") if data.get("ok") else None
     except (subprocess.SubprocessError, json.JSONDecodeError, ValueError):
         return None
 
 
-def build_items(worktrees, terminals, repo_groups=None):
+@functools.lru_cache(maxsize=1)
+def fetch_environments():
+    """Names of the paired remote runtimes. Looked up once per process — pair a new
+    machine and you restart the pane."""
+    if not INCLUDE_REMOTES:
+        return ()
+    envs = (_orca_json(["environment", "list", "--json"]) or {}).get("environments", [])
+    return tuple(e["name"] for e in envs if e.get("name"))
+
+
+def urgency_key(it):
+    """Urgency first — a pin shouldn't bury a stopped agent — then your pins, then
+    oldest-untouched first, so the agent you've ignored longest surfaces."""
+    return (STATUS.get(it["state"], DEFAULT)[0], not it["pinned"],
+            it["last_output"] or 0, it["id"])
+
+
+def build_items(worktrees, terminals, repo_groups=None, env=None):
     """Flat, urgency-sorted list of agent tiles. Pure — no I/O, so it's testable.
-    Each item: {id, repo, sub, state, handle, worktree_id, group}.
+    Each item: {id, repo, sub, state, agent_type, handle, title, last_output,
+    pinned, unread, pr, worktree_id, group}.
     repo_groups maps repoId -> projectGroupId (None -> group left unset)."""
     repo_groups = repo_groups or {}
     # agent paneKey ("{tabId}:{leafId}") -> terminal handle
     by_pane = {f"{t.get('tabId')}:{t.get('leafId')}": t.get("handle") for t in terminals}
+    # handle -> tab title; Orca writes "[ ! ] Action Required | <repo>" here when
+    # an agent is blocked on the human, which is a live signal its output isn't.
+    titles = {t.get("handle"): t.get("title") or "" for t in terminals}
+    last_out = {t.get("handle"): t.get("lastOutputAt") for t in terminals}
     # worktreeId -> handle of its most recently active terminal (fallback focus)
     recent = {}
     for t in terminals:
@@ -148,51 +202,75 @@ def build_items(worktrees, terminals, repo_groups=None):
         wid, repo = w["worktreeId"], w.get("repo", "?")
         branch = w.get("displayName") or ""
         group = repo_groups.get(w.get("repoId"))
+        # Orca already tracks these per worktree; the pane used to throw them away.
+        shared = {"repo": repo, "worktree_id": wid, "group": group, "env": env,
+                  "pinned": bool(w.get("isPinned")), "unread": bool(w.get("unread")),
+                  "pr": (w.get("linkedPR") or {}).get("number")}
         agents = w.get("agents") or []
         if agents:
             for a in agents:
                 handle = by_pane.get(a.get("paneKey")) or (recent.get(wid) or (0, None))[1]
                 items.append({
+                    **shared,
                     "id": a.get("paneKey") or wid,
-                    "repo": repo,
                     "sub": a.get("taskTitle") or a.get("displayName") or a.get("agentType") or branch,
                     # an interrupted/stopped agent is the "error" signal -> red.
                     "state": "interrupted" if a.get("interrupted") else a.get("state"),
+                    "agent_type": a.get("agentType"),
                     "handle": handle,
-                    "worktree_id": wid,
-                    "group": group,
+                    "title": titles.get(handle, ""),
+                    "last_output": last_out.get(handle) or w.get("lastOutputAt"),
                 })
         else:  # worktree with no agent session — show it at worktree level
+            handle = (recent.get(wid) or (0, None))[1]
             items.append({
-                "id": wid, "repo": repo, "sub": branch, "state": w.get("status"),
-                "handle": (recent.get(wid) or (0, None))[1], "worktree_id": wid,
-                "group": group,
+                **shared, "id": wid, "sub": branch, "state": w.get("status"),
+                "agent_type": None, "handle": handle,
+                "title": titles.get(handle, ""),
+                "last_output": last_out.get(handle) or w.get("lastOutputAt"),
             })
-    items.sort(key=lambda it: (STATUS.get(it["state"], DEFAULT)[0], it["id"]))
+    items.sort(key=urgency_key)
     return items
 
 
-def fetch_repo_groups():
+def fetch_repo_groups(env=None):
     """({repoId: groupId}, {repoName: groupId}) from `orca repo list`."""
-    repos = (_orca_json(["repo", "list", "--json"]) or {}).get("repos", [])
+    repos = (_orca_json(["repo", "list", "--json"], env) or {}).get("repos", [])
     by_id = {r["id"]: r.get("projectGroupId") for r in repos if r.get("id")}
     by_name = {r.get("displayName"): r.get("projectGroupId") for r in repos}
     return by_id, by_name
 
 
-def fetch_items():
-    """Query Orca and build the tile list, or None if orca is unreachable."""
-    wt = _orca_json(["worktree", "ps", "--json"])
+def fetch_env_items(env=None):
+    """Tiles for one machine, or None if that Orca is unreachable."""
+    wt = _orca_json(["worktree", "ps", "--json"], env)
     if wt is None:
         return None
-    terms = (_orca_json(["terminal", "list", "--json"]) or {}).get("terminals", [])
+    terms = (_orca_json(["terminal", "list", "--json"], env) or {}).get("terminals", [])
     # Only pay for the repo-list query when a group feature needs it (identicons
     # come straight from the repo name, which worktree ps already carries).
-    by_id, by_name = fetch_repo_groups() if (GROUP_ACCENT or GROUP_FILTER or GROUP_PAGES) else ({}, {})
-    items = build_items(wt.get("worktrees", []), terms, by_id)
+    by_id, by_name = fetch_repo_groups(env) if (GROUP_ACCENT or GROUP_FILTER or GROUP_PAGES) else ({}, {})
+    items = build_items(wt.get("worktrees", []), terms, by_id, env)
     if GROUP_FILTER:
         target = by_name.get(GROUP_FILTER)
         items = [it for it in items if it.get("group") == target]
+    return items
+
+
+def fetch_items():
+    """Every machine's tiles in one urgency-sorted list, or None when the *local*
+    Orca is unreachable (that's the pane being down; a remote being asleep just
+    means its agents drop off until it wakes)."""
+    envs = (None,) + fetch_environments()
+    if len(envs) == 1:
+        return fetch_env_items()
+    # In parallel: a poll should cost one round trip, not one per machine.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(envs)) as pool:
+        results = list(pool.map(fetch_env_items, envs))
+    if results[0] is None:
+        return None
+    items = [it for got in results if got for it in got]
+    items.sort(key=urgency_key)
     return items
 
 
@@ -223,21 +301,94 @@ def paginate_grouped(items, key_count):
 
 # --- Actions ---------------------------------------------------------------
 
-def focus_terminal(handle):
-    if handle:
-        subprocess.run(["orca", "terminal", "switch", "--terminal", handle],
-                       capture_output=True, timeout=15)
-    subprocess.Popen(["open", "-a", "Orca"])
+def send_to_terminal(args, handle, env=None):
+    """Run an `orca terminal` command against ONE terminal, or do nothing.
 
-
-def interrupt_terminal(handle):
-    subprocess.run(["orca", "terminal", "send", "--terminal", handle, "--interrupt"],
+    The guard is the point: with an empty --terminal the CLI falls back to "the
+    active terminal in the current worktree", so a lost handle doesn't fail, it
+    hits whatever is in front of you — on a machine you may not be looking at."""
+    if not handle:
+        return False
+    subprocess.run(_orca_cmd([*args, "--terminal", handle], env),
                    capture_output=True, timeout=15)
+    return True
+
+
+def focus_terminal(handle, env=None):
+    send_to_terminal(["terminal", "switch"], handle, env)
+    if not env:     # raising the local app can't help you see another machine
+        subprocess.Popen(["open", "-a", "Orca"])
+
+
+def interrupt_terminal(handle, env=None):
+    send_to_terminal(["terminal", "send", "--interrupt"], handle, env)
+
+
+# ponytail: run the auto-approver as a child process rather than importing it —
+# it imports this module, so in-process would mean an import cycle. Its log lines
+# land in the deck's own log, and it dies with the deck.
+AUTO_APPROVE_CMD = [sys.executable, "-u",
+                    str(pathlib.Path(__file__).with_name("orca_autoapprove.py"))]
+# How long a single arming lasts. None = until you disarm it; the deck's status
+# key cycles off -> 30m -> 1h -> forever -> off, so the timed options stay the
+# ones you reach first — blind approval is a mode you WILL forget you left on.
+AUTO_DURATIONS = (30, 60, None)
+ARMED_FILE = pathlib.Path.home() / ".orca-streamdeck-armed"
+FOREVER = float("inf")      # an expiry that never arrives, so "forever" needs no
+                            # special case in the compare or on disk
+
+
+def duration_label(minutes):
+    return "Forever" if minutes is None else (
+        f"{minutes} min" if minutes < 60 else f"{minutes // 60} hour")
+
+
+def disarm_autoapprove(proc):
+    """Stop the auto-approver and forget the deadline. Returns (None, None)."""
+    if proc and proc.poll() is None:
+        proc.terminate()
+    ARMED_FILE.unlink(missing_ok=True)
+    return None, None
+
+
+def arm_autoapprove(proc, minutes, now, idx=0):
+    """Run the codex auto-approver for `minutes` (None = forever).
+    Returns (process, expiry epoch).
+
+    The deadline is written to disk so a deck crash (launchd restarts us) comes
+    back armed instead of silently dropping to off — but a timed window can't be
+    resurrected once it has passed. Any other auto-approver is killed first: two
+    of them would each press Enter on the same modal."""
+    disarm_autoapprove(proc)
+    subprocess.run(["pkill", "-f", "orca_autoapprove.py"], capture_output=True)
+    until = FOREVER if minutes is None else now + minutes * 60
+    ARMED_FILE.write_text(f"{until} {idx}")
+    return subprocess.Popen(AUTO_APPROVE_CMD), until
+
+
+def cycle_autoapprove(proc, idx, now):
+    """What holding the status key does: step to the next duration, wrapping back
+    to off after the last one. Returns (process, expiry, duration index)."""
+    idx = -1 if idx >= len(AUTO_DURATIONS) - 1 else idx + 1
+    if idx < 0:
+        return (*disarm_autoapprove(proc), idx)
+    return (*arm_autoapprove(proc, AUTO_DURATIONS[idx], now, idx), idx)
+
+
+def armed_state(now):
+    """(expiry, duration index) left by a previous run, or None if it has lapsed
+    or was never set."""
+    try:
+        until, idx = ARMED_FILE.read_text().split()
+        until, idx = float(until), int(idx)
+    except (OSError, ValueError):
+        return None
+    return (until, idx) if until > now else None
 
 
 # --- Rendering -------------------------------------------------------------
 
-def render_tile(deck, item):
+def render_tile(deck, item, now_ms=0):
     img = PILHelper.create_image(deck)
     draw = ImageDraw.Draw(img)
     w, h = img.size
@@ -260,12 +411,37 @@ def render_tile(deck, item):
                   font=load_font(round(w * 0.13)), anchor="mm", fill=sub_fg)
         draw.text((w // 2, h - h * 0.13), label, font=load_font(round(w * 0.13)),
                   anchor="mm", fill=fg)
+    # Corner marks, each short enough to stay legible on a Mini key: age top-right,
+    # linked PR top-left, and an unread dot bottom-right.
+    corner = load_font(round(w * 0.12))
+    age = age_label(item.get("last_output"), now_ms)
+    if age:
+        draw.text((w - w * 0.04, h * 0.04), age, anchor="ra", font=corner, fill=fg)
+    if item.get("pr"):
+        draw.text((w * 0.04, h * 0.04), f"#{item['pr']}", anchor="la", font=corner, fill=fg)
+    if item.get("unread"):
+        r = max(2, w * 0.045)
+        draw.ellipse([w - w * 0.05 - 2 * r, h - h * 0.05 - 2 * r,
+                      w - w * 0.05, h - h * 0.05], fill=fg)
+    if item.get("env"):     # lives on another machine — stripe down the right edge
+        draw.rectangle([w - max(3, w * 0.06), 0, w, h], fill=group_color(item["env"]))
     if GROUP_ACCENT and item.get("group"):
         draw.rectangle([0, 0, max(3, w * 0.09), h], fill=group_color(item["group"]))
     return PILHelper.to_native_format(deck, img)
 
 
-def render_status(deck, count, page, pages, down=False):
+def auto_badge(until, now):
+    """Status-key badge for the auto-approver: how much longer it stays armed.
+    Blank when off. Time remaining beats the word "on" — the whole point of the
+    window is knowing it's closing."""
+    if not until:
+        return ""
+    if until == FOREVER:
+        return "AUTO ON"
+    return "AUTO " + age_label(now * 1000, until * 1000)   # elapsed helper, run backwards
+
+
+def render_status(deck, count, page, pages, down=False, auto=""):
     img = PILHelper.create_image(deck)
     draw = ImageDraw.Draw(img)
     w, h = img.size
@@ -286,10 +462,40 @@ def render_status(deck, count, page, pages, down=False):
     if pages > 1:
         draw.text((w - w * 0.02, h * 0.06), f"{page + 1}/{pages}",
                   font=load_font(round(w * 0.12)), anchor="ra", fill=(230, 230, 235))
+    if auto:  # codex auto-approve is armed — amber, the same "hands off" hue
+        draw.text((w * 0.04, h * 0.06), auto, font=load_font(round(w * 0.12)),
+                  anchor="la", fill=(240, 170, 40))
     return PILHelper.to_native_format(deck, img)
 
 
 # --- Main loop -------------------------------------------------------------
+
+def repaint(deck, state, n, nav_key):
+    """Draw the current page from the items already in `state` and return the
+    needs-you count. Split out from the poll so a page flip repaints instantly
+    instead of waiting on a fresh round of `orca` calls. Callers hold the lock."""
+    items = state["items"]
+    now = time.time()
+    count = sum(1 for it in items if it["state"] in NEEDS_HUMAN)
+    pages = paginate_grouped(items, n) if GROUP_PAGES else paginate(items, n)
+    page = state["page"] % len(pages)
+    page_items = pages[page]
+    p = state["auto"]
+    alive = bool(p and p.poll() is None)        # False again if it died on its own
+    badge = auto_badge(state["auto_until"] if alive else None, now)
+    slots = [None] * n
+    for k in range(n):
+        if k == nav_key:
+            deck.set_key_image(k, render_status(deck, count, page, len(pages),
+                                                auto=badge))
+        elif k < len(page_items):
+            slots[k] = page_items[k]
+            deck.set_key_image(k, render_tile(deck, page_items[k], now * 1000))
+        else:
+            deck.set_key_image(k, render_tile(deck, None))
+    state.update(page=page, pages=len(pages), slots=slots)
+    return count
+
 
 def main():
     decks = DeviceManager().enumerate()
@@ -304,8 +510,18 @@ def main():
 
     lock = threading.Lock()
     wake = threading.Event()
-    state = {"page": 0, "pages": 1, "slots": [None] * n}  # slots[k] = item or None
+    # slots[k] = item or None; auto = the auto-approver child, auto_until its
+    # expiry, auto_idx which AUTO_DURATIONS entry is active (-1 = off)
+    state = {"page": 0, "pages": 1, "slots": [None] * n, "items": [],
+             "auto": None, "auto_until": None, "auto_idx": -1}
     press_at = {}  # key -> monotonic time of key-down
+
+    resumed = armed_state(time.time())          # armed when the deck last died?
+    if resumed:
+        state["auto"] = subprocess.Popen(AUTO_APPROVE_CMD)
+        state["auto_until"], state["auto_idx"] = resumed
+        print("Resumed codex auto-approve "
+              f"({auto_badge(state['auto_until'], time.time()) or 'off'})")
 
     def on_press(_deck, key, pressed):
         if pressed:
@@ -314,15 +530,21 @@ def main():
         held = time.monotonic() - press_at.pop(key, time.monotonic())
         with lock:
             if key == nav_key:
-                if state["pages"] > 1:
+                if held >= LONG_PRESS_SEC:      # hold = next auto-approve duration
+                    (state["auto"], state["auto_until"],
+                     state["auto_idx"]) = cycle_autoapprove(
+                        state["auto"], state["auto_idx"], time.time())
+                elif state["pages"] > 1:
                     state["page"] = (state["page"] + 1) % state["pages"]
-                    wake.set()
+                repaint(deck, state, n, nav_key)   # don't wait for the next poll
+                wake.set()
                 return
             item = state["slots"][key] if key < n else None
         if not item:
             return
         action = interrupt_terminal if (held >= LONG_PRESS_SEC and item["handle"]) else focus_terminal
-        threading.Thread(target=action, args=(item["handle"],), daemon=True).start()
+        threading.Thread(target=action, args=(item["handle"], item.get("env")),
+                         daemon=True).start()
 
     deck.set_key_callback(on_press)
 
@@ -333,8 +555,13 @@ def main():
             pulse_on = not pulse_on
 
             with lock:
+                if state["auto_until"] and time.time() >= state["auto_until"]:
+                    state["auto"], state["auto_until"] = disarm_autoapprove(state["auto"])
+                    state["auto_idx"] = -1              # window's up (never for FOREVER)
+                    print("Codex auto-approve expired")
+
                 if items is None:
-                    state.update(page=0, pages=1, slots=[None] * n)
+                    state.update(page=0, pages=1, slots=[None] * n, items=[])
                     for k in range(n):
                         deck.set_key_image(k, render_status(deck, 0, 0, 1, down=True)
                                            if k == nav_key else render_tile(deck, None))
@@ -342,20 +569,8 @@ def main():
                     wake.wait(POLL_SECONDS); wake.clear()
                     continue
 
-                count = sum(1 for it in items if it["state"] in NEEDS_HUMAN)
-                pages = paginate_grouped(items, n) if GROUP_PAGES else paginate(items, n)
-                page = state["page"] % len(pages)
-                page_items = pages[page]
-                slots = [None] * n
-                for k in range(n):
-                    if k == nav_key:
-                        deck.set_key_image(k, render_status(deck, count, page, len(pages)))
-                    elif k < len(page_items):
-                        slots[k] = page_items[k]
-                        deck.set_key_image(k, render_tile(deck, page_items[k]))
-                    else:
-                        deck.set_key_image(k, render_tile(deck, None))
-                state.update(page=page, pages=len(pages), slots=slots)
+                state["items"] = items
+                count = repaint(deck, state, n, nav_key)
                 deck.set_brightness(PULSE[pulse_on] if count else DIM_BRIGHTNESS)
 
             wake.wait(POLL_SECONDS)
@@ -363,6 +578,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if state["auto"]:
+            # Orphan nothing — but leave ARMED_FILE alone: if launchd restarts us
+            # inside the window we come back armed.
+            state["auto"].terminate()
         deck.reset()
         deck.close()
 
