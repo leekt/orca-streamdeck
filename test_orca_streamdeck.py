@@ -343,58 +343,50 @@ def _restore():
     m.ARMED_FILE = _REAL_ARMED_FILE
 
 
-def test_every_start_kills_any_other_daemon():
-    """Two auto-approvers each press Enter on the same modal. The resume path
-    used to spawn directly and skip this guard, so restarts stacked them up."""
-    killed, spawned = [], _fake_procs()
-    m.subprocess.run = lambda cmd, **k: killed.append(cmd)
-    try:
-        m.spawn_autoapprove()
-        assert killed == [["pkill", "-f", "orca_autoapprove.py"]]
-        assert spawned[-1] == m.AUTO_APPROVE_CMD
-        m.arm_autoapprove(None, 30, 1000.0)          # the armed path guards too
-        assert len(killed) == 2
-        m.spawn_autoapprove(only="h")
-        assert spawned[-1][-2:] == ["--only", "h"] and len(killed) == 3
-    finally:
-        _restore()
-
 
 def test_arm_autoapprove_persists_a_deadline_that_expires():
-    spawned = _fake_procs()
+    m.ARMED_FILE = _TMP_ARMED
     try:
-        p, until = m.arm_autoapprove(None, 30, 1000.0, 0)
-        assert p.alive and spawned[0] == m.AUTO_APPROVE_CMD
-        assert until == 1000.0 + 30 * 60
-        assert m.armed_state(1000.0) == (until, 0)  # survives a deck crash...
-        assert m.armed_state(until + 1) is None     # ...but not past its window
-
-        assert m.disarm_autoapprove(p) == (None, None) and p.terminated
-        assert m.armed_state(2000.0) is None        # disarming clears the file
+        until, only = m.arm_autoapprove(30, 1000.0, 0)
+        assert until == 1000.0 + 30 * 60 and only is None
+        assert m.armed_state(1000.0) == (until, 0, None)   # survives any crash...
+        assert m.armed_state(until + 1) is None            # ...but not its window
+        assert m.disarm_autoapprove() == (None, None)
+        assert m.armed_state(2000.0) is None               # disarming clears it
     finally:
         _restore()
 
 
 def test_arm_autoapprove_forever_never_expires():
-    _fake_procs()
+    m.ARMED_FILE = _TMP_ARMED
     try:
-        _, until = m.arm_autoapprove(None, None, 1000.0, 2)
+        until, _ = m.arm_autoapprove(None, 1000.0, 2)
         assert until == m.FOREVER
-        # a year later it's still armed, and the index round-trips through the file
-        assert m.armed_state(1000.0 + 86400 * 365) == (m.FOREVER, 2)
+        # a year on it is still armed, and the index round-trips through the file
+        assert m.armed_state(1000.0 + 86400 * 365) == (m.FOREVER, 2, None)
+    finally:
+        _restore()
+
+
+def test_arm_autoapprove_records_a_scope():
+    m.ARMED_FILE = _TMP_ARMED
+    try:
+        m.arm_autoapprove(30, 1000.0, 0, only="term_x")
+        assert m.armed_state(1000.0) == (1000.0 + 1800, 0, "term_x")
     finally:
         _restore()
 
 
 def test_cycle_autoapprove_walks_off_30m_1h_forever_off():
-    _fake_procs()
+    m.ARMED_FILE = _TMP_ARMED
     try:
-        proc, idx, seen = None, -1, []
+        idx, seen = -1, []
         for _ in range(len(m.AUTO_DURATIONS) + 1):
-            proc, until, idx = m.cycle_autoapprove(proc, idx, 1000.0)
+            until, _only, idx = m.cycle_autoapprove(idx, 1000.0)
             seen.append((idx, until))
         assert [i for i, _ in seen] == [0, 1, 2, -1]        # wraps back to off
         assert [u for _, u in seen] == [1000.0 + 1800, 1000.0 + 3600, m.FOREVER, None]
+        assert not m.ARMED_FILE.exists()                    # ...and stands down
     finally:
         _restore()
 
@@ -404,7 +396,7 @@ def test_armed_state_ignores_a_missing_or_junk_file():
     try:
         m.ARMED_FILE.unlink(missing_ok=True)
         assert m.armed_state(0) is None             # never armed
-        for junk in ("not-a-number", "123", "abc 0", "1e9 x"):
+        for junk in ("not-a-number", "123", "abc 0", "1e9 x", ""):
             m.ARMED_FILE.write_text(junk)           # corrupt -> off, not a crash
             assert m.armed_state(0) is None, junk
     finally:
@@ -505,16 +497,16 @@ def test_agent_action_routes_taps_and_holds():
 
 
 def test_agent_action_auto_scopes_to_one_handle_and_toggles_off():
-    spawned = _fake_procs()
+    m.ARMED_FILE = _TMP_ARMED
     try:
-        st = {"auto": None, "auto_until": None, "auto_only": None}
+        st = {}
         st.update(m.agent_action(st, "auto", _agent(), 0, lambda *a: None))
-        assert st["auto_only"] == "h" and st["auto_idx"] == -1
-        assert spawned[0][-2:] == ["--only", "h"]      # daemon told to trust one
-        assert not m.ARMED_FILE.exists()               # scoped arming isn't resumed
+        armed = m.armed_state(m.time.time())
+        assert armed and armed[2] == "h"        # daemon told to trust just this one
+        assert st["auto_idx"] == -1             # scoped, so no fleet duration
 
         st.update(m.agent_action(st, "auto", _agent(), 0, lambda *a: None))
-        assert st["auto_only"] is None and st["auto"] is None   # pressing again stops
+        assert m.armed_state(m.time.time()) is None      # pressing again stands down
     finally:
         _restore()
 
