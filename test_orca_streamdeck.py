@@ -137,6 +137,23 @@ def test_fetch_items_merges_machines_and_survives_a_sleeping_one():
         m.fetch_environments, m.fetch_env_items = _REAL_ENVS, _REAL_ENV_ITEMS
 
 
+def test_any_blocked_is_the_cheap_trigger():
+    """One `terminal list` per machine instead of a full fetch — it must still
+    notice a flag on ANY machine, and must not fire on ordinary titles."""
+    m.fetch_environments = lambda: ("mac mini",)
+    try:
+        m.fetch_titles = lambda env=None: {"h": "⠂ working on it"}
+        assert m.any_blocked() is False
+        # flagged only on the remote -> still caught
+        m.fetch_titles = lambda env=None: ({"h": BLOCKED_TITLE} if env
+                                           else {"h": "⠂ working"})
+        assert m.any_blocked() is True
+        m.fetch_titles = lambda env=None: {}
+        assert m.any_blocked() is False
+    finally:
+        m.fetch_environments, m.fetch_titles = _REAL_ENVS, _REAL_TITLES
+
+
 def test_icon_differs_for_the_same_repo_on_another_machine():
     here = m.icon_image({"repo": "deployer"}, 40)
     there = m.icon_image({"repo": "deployer", "env": "mac mini"}, 40)
@@ -313,6 +330,7 @@ _REAL_ENVS, _REAL_ENV_ITEMS = m.fetch_environments, m.fetch_env_items
 _REAL_READ_TAIL = m.read_tail
 _REAL_FETCH_ITEMS = m.fetch_items
 _REAL_ORCA_JSON = m._orca_json
+_REAL_TITLES = m.fetch_titles
 _REAL_ARMED_FILE = m.ARMED_FILE
 _TMP_ARMED = m.pathlib.Path(__file__).with_name(".armed-test")
 
