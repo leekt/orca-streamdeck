@@ -53,29 +53,49 @@ def approve(handle, env=None):
     return core.send_to_terminal(["terminal", "send", "--enter"], handle, env)
 
 
+_unreadable = set()      # handles already reported as unverifiable, so we warn once
+
+
 def poll(sent_at, now):
     """One sweep. `sent_at` maps handle -> when we last pressed Enter there;
     mutated in place. Returns (handle, description) for each modal approved."""
-    # Gate on Orca's flag before reading anything: it's already in hand, and the
-    # agent's own `state` is no use here (a codex agent mid-command still reports
-    # "waiting"). So a quiet fleet costs zero extra orca calls.
+    # Walk flagged TERMINALS, not agents. Orca has no agent record for every pane
+    # — a codex asking for approval can come back with agent_type None — and
+    # filtering on the agent list silently skipped exactly those.
     fresh = []
-    for it in (core.fetch_items() or []):
-        h, env = it["handle"], it.get("env")
-        if it.get("agent_type") != AGENT_TYPE or not h or not is_blocked(it.get("title")):
-            continue
-        if ONLY and h not in ONLY:
-            continue
-        if REPOS is not None and it["repo"] not in REPOS:
-            continue
-        if now - sent_at.get(h, float("-inf")) < RETRY_SECONDS:
-            continue          # just answered; give the modal time to clear
-        tail = read_tail(h, env)
-        if wants_approval(tail, it["title"]):
-            approve(h, env)
-            sent_at[h] = now
-            where = f"{env}/{it['repo']}" if env else it["repo"]
-            fresh.append((h, f"{where}: {describe(tail)}"))
+    by_handle = {it["handle"]: it for it in (core.fetch_items() or []) if it["handle"]}
+    for env in (None,) + core.fetch_environments():
+        for h, title in core.fetch_titles(env).items():
+            if not is_blocked(title):
+                continue
+            it = by_handle.get(h, {})
+            # A *known* claude agent is never ours. An unknown pane might well be
+            # codex, and the modal markers below are codex-specific strings, so
+            # they gate it safely on their own.
+            if it.get("agent_type") not in (AGENT_TYPE, None):
+                continue
+            repo = it.get("repo") or "?"
+            if ONLY and h not in ONLY:
+                continue
+            if REPOS is not None and repo not in REPOS:
+                continue
+            if now - sent_at.get(h, float("-inf")) < RETRY_SECONDS:
+                continue      # just answered; give the modal time to clear
+            tail = read_tail(h, env)
+            where = f"{env}/{repo}" if env else repo
+            if wants_approval(tail, title):
+                approve(h, env)
+                sent_at[h] = now
+                fresh.append((h, f"{where}: {describe(tail)}"))
+            elif len(tail.strip("• \n")) < 20 and h not in _unreadable:
+                # Orca is flagging this pane but has captured no output for it
+                # (happens after an Orca restart: it reattaches to the pty, and a
+                # codex sitting on a modal never repaints). Can't confirm what's
+                # on screen, so refuse to press — but say so instead of silently
+                # ignoring it, which is how one sat unanswered.
+                _unreadable.add(h)
+                print(f"NEEDS YOU {where}: flagged, but no captured output to "
+                      f"verify — approve it yourself ({h})", flush=True)
     return fresh
 
 
