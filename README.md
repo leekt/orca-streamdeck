@@ -155,8 +155,13 @@ narrowest **"Yes, just this once"**, so no standing rule is ever granted.
   The agent's own `waiting` state is useless here (codex reports it mid-command),
   and `terminal show`'s `preview` is too small — 300 chars of the same stream,
   and codex keeps printing after drawing the modal, so it often sits further back.
-- The tail read only happens for terminals Orca has already flagged, so a quiet
-  fleet costs no extra `orca` calls.
+- **Polls every 0.5s** (`ARMED_POLL`), not the deck's 2s — it's a reflex, not a
+  display. Each tick costs one `terminal list` per machine (~0.3s here) to ask
+  "is anything flagged?", because the tab title *is* the whole trigger. Only when
+  something is flagged does it pay for the full fleet query (~0.55s) and a tail
+  read. Disarmed it makes no `orca` calls at all.
+- Your poll rate is no longer the floor: Orca still has to notice and flag the
+  tab, and that latency isn't ours to control.
 - Every approval logs **what** it agreed to — `approved orchestra-web: Would you
   like to make the following edits` — not just an opaque terminal handle.
 - `REPOS = {"orchestra-web"}` in `orca_autoapprove.py` limits it to named repos
