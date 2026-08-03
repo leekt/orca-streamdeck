@@ -168,6 +168,14 @@ narrowest **"Yes, just this once"**, so no standing rule is ever granted.
   (default `None` = whole fleet). Worth setting if any worktree holds credentials.
 - At most one Enter per terminal per `RETRY_SECONDS` (4s), so it can't spam but
   still answers codex asking three times in a row.
+- Works from **flagged terminals, not the agent list**. Orca has no agent record
+  for every pane — a codex asking for approval can report `agent_type: None` —
+  and filtering on agents silently skipped exactly those. Known *claude* agents
+  are still excluded; unknown panes are gated by the codex-specific markers.
+- If a pane is flagged but Orca has **captured no output** for it, there's nothing
+  to verify against, so it refuses to press and logs `NEEDS YOU …` instead. This
+  happens after an Orca restart: it reattaches to the pty, and a codex already
+  sitting on a modal never repaints, so the buffer stays empty.
 - **Claude agents are untouched**, and codex's ask-the-user *question* widget is
   skipped (Enter there would submit a blank answer).
 
