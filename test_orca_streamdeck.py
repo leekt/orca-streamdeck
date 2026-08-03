@@ -5,6 +5,16 @@ import orca_cleanup as cleanup
 import orca_streamdeck as m
 
 
+_REAL_POPEN, _REAL_RUN = m.subprocess.Popen, m.subprocess.run
+_REAL_ENVS, _REAL_ENV_ITEMS = m.fetch_environments, m.fetch_env_items
+_REAL_READ_TAIL = m.read_tail
+_REAL_FETCH_ITEMS = m.fetch_items
+_REAL_ORCA_JSON = m._orca_json
+_REAL_TITLES = m.fetch_titles
+_REAL_ARMED_FILE = m.ARMED_FILE
+_TMP_ARMED = m.pathlib.Path(__file__).with_name(".armed-test")
+
+
 def test_needs_human_set():
     assert m.NEEDS_HUMAN == {"permission", "waiting"}
 
@@ -282,68 +292,6 @@ def _handles(approved):
     return [h for h, _ in approved]
 
 
-def test_poll_presses_enter_only_for_blocked_codex_and_rate_limits_retries():
-    sent, tails, reads = [], {"c": PROMPT, "k": PROMPT}, []
-    items = [
-        {"agent_type": "codex", "handle": "c", "title": BLOCKED_TITLE, "repo": "web"},
-        {"agent_type": "claude", "handle": "k", "title": BLOCKED_TITLE, "repo": "web"},
-        {"agent_type": "codex", "handle": None, "title": BLOCKED_TITLE, "repo": "web"},
-        {"agent_type": "codex", "handle": "d", "title": BUSY_TITLE, "repo": "web"},
-    ]
-    auto.core.fetch_items = lambda: items
-    auto.read_tail = lambda h, env=None: reads.append(h) or tails[h]
-    auto.approve = lambda h, env=None: sent.append(h)
-
-    at = {}
-    try:
-        first = auto.poll(at, 100.0)
-        assert _handles(first) == ["c"] and sent == ["c"]        # claude never touched
-        assert first[0][1].startswith("web: ")                   # log line names the repo
-        assert reads == ["c"]        # unflagged terminals are never even read
-        assert auto.poll(at, 101.0) == [] and sent == ["c"]      # inside the retry window
-        # still flagged with a modal after the window -> codex asked again, press again
-        assert _handles(auto.poll(at, 100.0 + auto.RETRY_SECONDS)) == ["c"]
-        items[0]["title"] = BUSY_TITLE
-        assert auto.poll(at, 200.0) == [] and sent == ["c", "c"]  # unblocked -> quiet
-    finally:
-        m.fetch_items = _REAL_FETCH_ITEMS
-
-
-def test_poll_honours_the_repo_allowlist():
-    auto.core.fetch_items = lambda: [
-        {"agent_type": "codex", "handle": "c", "title": BLOCKED_TITLE, "repo": "web"},
-        {"agent_type": "codex", "handle": "x", "title": BLOCKED_TITLE, "repo": "prod"},
-    ]
-    auto.read_tail = lambda h, env=None: PROMPT
-    sent = []
-    auto.approve = lambda h, env=None: sent.append(h)
-    auto.REPOS = {"web"}
-    try:
-        assert _handles(auto.poll({}, 100.0)) == ["c"]   # prod is off limits
-    finally:
-        auto.REPOS = None
-        m.fetch_items = _REAL_FETCH_ITEMS
-
-
-_REAL_POPEN, _REAL_RUN = m.subprocess.Popen, m.subprocess.run
-_REAL_ENVS, _REAL_ENV_ITEMS = m.fetch_environments, m.fetch_env_items
-_REAL_READ_TAIL = m.read_tail
-_REAL_FETCH_ITEMS = m.fetch_items
-_REAL_ORCA_JSON = m._orca_json
-_REAL_TITLES = m.fetch_titles
-_REAL_ARMED_FILE = m.ARMED_FILE
-_TMP_ARMED = m.pathlib.Path(__file__).with_name(".armed-test")
-
-
-class FakeProc:
-    def __init__(self, alive=True):
-        self.alive, self.terminated = alive, False
-
-    def poll(self):
-        return None if self.alive else 0
-
-    def terminate(self):
-        self.terminated, self.alive = True, False
 
 
 def _fake_procs():
@@ -529,19 +477,6 @@ def test_agent_action_auto_scopes_to_one_handle_and_toggles_off():
         _restore()
 
 
-def test_autoapprove_only_flag_narrows_to_one_terminal():
-    auto.core.fetch_items = lambda: [
-        _agent(id="1", handle="mine"), _agent(id="2", handle="other")]
-    auto.read_tail = lambda h, env=None: PROMPT
-    sent = []
-    auto.approve = lambda h, env=None: sent.append(h)
-    auto.ONLY = {"mine"}
-    try:
-        assert _handles(auto.poll({}, 100.0)) == ["mine"]
-    finally:
-        auto.ONLY = set()
-        m.fetch_items = _REAL_FETCH_ITEMS
-
 
 def _wt(**kw):
     base = {"worktreeId": "R::/p", "repo": "web", "displayName": "fix/x",
@@ -585,6 +520,88 @@ def test_cleanup_act_picks_the_right_command():
         assert sent[-1] == (["worktree", "rm", "--worktree", "id:R::/p", "--json"], None)
     finally:
         cleanup.core._orca_json = _REAL_ORCA_JSON
+
+
+def _stub_fleet(titles, items=(), tails=None, sent=None):
+    """Stub what poll() actually calls now: flagged titles per machine, plus the
+    item list it consults for repo/agent_type."""
+    auto.core.fetch_environments = lambda: ()
+    auto.core.fetch_titles = lambda env=None: titles
+    auto.core.fetch_items = lambda: list(items)
+    auto.read_tail = lambda h, env=None: (tails or {}).get(h, PROMPT)
+    auto.approve = lambda h, env=None: (sent if sent is not None else []).append(h)
+    auto._unreadable.clear()
+
+
+def _unstub():
+    auto.core.fetch_environments, auto.core.fetch_titles = _REAL_ENVS, _REAL_TITLES
+    m.fetch_items, auto.read_tail = _REAL_FETCH_ITEMS, _REAL_READ_TAIL
+    auto._unreadable.clear()
+
+
+def test_poll_answers_a_codex_orca_has_no_agent_record_for():
+    """The pane that sat unanswered: Orca flagged it, but agent_type came back
+    None, so filtering on the agent list skipped it entirely."""
+    sent = []
+    _stub_fleet({"ghost": BLOCKED_TITLE},
+                items=[{"handle": "ghost", "repo": "web", "agent_type": None}],
+                sent=sent)
+    try:
+        assert _handles(auto.poll({}, 100.0)) == ["ghost"] and sent == ["ghost"]
+        # a terminal Orca doesn't list as an item at all still gets answered
+        _stub_fleet({"unknown": BLOCKED_TITLE}, items=[], sent=sent)
+        assert _handles(auto.poll({}, 100.0)) == ["unknown"]
+    finally:
+        _unstub()
+
+
+def test_poll_still_never_touches_a_claude_agent():
+    sent = []
+    _stub_fleet({"k": BLOCKED_TITLE},
+                items=[{"handle": "k", "repo": "web", "agent_type": "claude"}],
+                sent=sent)
+    try:
+        assert auto.poll({}, 100.0) == [] and sent == []
+    finally:
+        _unstub()
+
+
+def test_poll_reports_a_flagged_pane_it_cannot_verify():
+    """Orca restarts, reattaches to the pty, and a codex already sitting on a
+    modal never repaints — so there's no captured output to confirm against.
+    Refuse to press, but say so rather than ignoring it in silence."""
+    sent = []
+    _stub_fleet({"blind": BLOCKED_TITLE}, items=[],
+                tails={"blind": "\u2022\u2022\u2022\u2022\u2022\u2022"}, sent=sent)
+    try:
+        assert auto.poll({}, 100.0) == [] and sent == []    # nothing pressed
+        assert "blind" in auto._unreadable                  # and it was reported
+    finally:
+        _unstub()
+
+
+def test_poll_rate_limits_and_honours_both_scopes():
+    sent = []
+    titles = {"c": BLOCKED_TITLE, "other": BLOCKED_TITLE}
+    items = [{"handle": "c", "repo": "web", "agent_type": "codex"},
+             {"handle": "other", "repo": "prod", "agent_type": "codex"}]
+    _stub_fleet(titles, items=items, sent=sent)
+    at = {}
+    try:
+        first = auto.poll(at, 100.0)
+        assert sorted(_handles(first)) == ["c", "other"]
+        assert any(x[1].startswith("web: ") for x in first)   # log names the repo
+        assert auto.poll(at, 101.0) == []                     # inside retry window
+        assert _handles(auto.poll(at, 100.0 + auto.RETRY_SECONDS))  # asked again
+
+        auto.REPOS = {"web"}                                  # repo allowlist
+        assert _handles(auto.poll({}, 200.0)) == ["c"]
+        auto.REPOS = None
+        auto.ONLY = {"other"}                                 # per-agent scope
+        assert _handles(auto.poll({}, 300.0)) == ["other"]
+    finally:
+        auto.REPOS, auto.ONLY = None, set()
+        _unstub()
 
 
 if __name__ == "__main__":
