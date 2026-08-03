@@ -245,6 +245,26 @@ def read_tail(handle, env=None):
     return "".join((r.get("terminal") or {}).get("tail") or [])
 
 
+def fetch_titles(env=None):
+    """{handle: tab title} for one machine — the cheap half of a poll."""
+    ts = (_orca_json(["terminal", "list", "--json"], env) or {}).get("terminals", [])
+    return {t["handle"]: t.get("title") or "" for t in ts if t.get("handle")}
+
+
+def any_blocked():
+    """Is any machine flagging a tab as needing the human?
+
+    One `terminal list` per machine (~0.27s here) against ~0.55s for a full
+    fetch_items, because the title IS the whole trigger. Lets the auto-approver
+    poll twice as often for the same money and only pay for the rest when there's
+    actually something to answer."""
+    envs = (None,) + fetch_environments()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(envs)) as pool:
+        return any(is_blocked(t)
+                   for titles in pool.map(fetch_titles, envs)
+                   for t in titles.values())
+
+
 def fetch_repo_groups(env=None):
     """({repoId: groupId}, {repoName: groupId}) from `orca repo list`."""
     repos = (_orca_json(["repo", "list", "--json"], env) or {}).get("repos", [])

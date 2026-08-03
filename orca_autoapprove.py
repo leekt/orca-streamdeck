@@ -79,6 +79,10 @@ def poll(sent_at, now):
     return fresh
 
 
+# The deck polls every core.POLL_SECONDS because it's a display; this is a
+# reflex, so it runs faster. Each armed tick costs one `terminal list` per machine
+# (~0.3s) and nothing else until something is actually flagged.
+ARMED_POLL = 0.5
 IDLE_SECONDS = 5.0    # how often to re-check the arm file while stood down
 
 
@@ -105,9 +109,12 @@ def main():
         # A scope in the file beats the command line; the deck owns it at runtime.
         global ONLY
         ONLY = {armed[2]} if (armed and armed[2]) else (ONLY if always else set())
-        for _, what in poll(sent_at, time.monotonic()):
-            print(f"approved {what}", flush=True)
-        time.sleep(core.POLL_SECONDS)
+        # Cheap trigger first: skip the full fleet query unless Orca is flagging
+        # something. Nothing to answer is by far the common case.
+        if core.any_blocked():
+            for _, what in poll(sent_at, time.monotonic()):
+                print(f"approved {what}", flush=True)
+        time.sleep(ARMED_POLL)
 
 
 if __name__ == "__main__":
