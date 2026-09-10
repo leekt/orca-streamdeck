@@ -2,7 +2,9 @@
 
 Live Herdr agent controls on an Elgato Stream Deck, with an optional macOS menu
 bar app. One tile per recognized agent in your configured local Herdr session
-and enabled saved SSH machines.
+and enabled saved SSH machines. A single Rust binary provides the deck
+controller, the Codex approval helper, status inspection, the menu bar, and the
+LaunchAgent installer.
 
 ## Controls
 
@@ -45,21 +47,21 @@ the action page also returns after 30 seconds without a keypress.
 
 ## Setup
 
-Requires macOS, Python 3.10+, Herdr with `api snapshot` and agent control commands
+Requires macOS, Rust 1.85+, Herdr with `api snapshot` and agent control commands
 (0.9.0+ for saved SSH machines), and a Stream Deck with at least six display keys.
-The Pedal, dials, and touch strips are not supported.
+The Pedal, dials, and touch strips are not supported. The USB HID library is
+compiled into the binary; no Homebrew packages are needed.
 
 ```sh
-python3 -m venv .venv
-./.venv/bin/python -m pip install -r requirements.txt
-brew install hidapi
-./.venv/bin/python herdr_backend.py
+cargo build --release
+./target/release/herdr-streamdeck status
 ./run.sh
 ```
 
-The backend command prints agent tiles as JSON without opening the USB device
-or sending input. `run.sh` quits Elgato's app to release the USB device and runs
-the controller. Ctrl-C stops it. Elgato's app remains closed.
+`status` prints machine connectivity and agent tiles as JSON without opening
+the USB device or sending input, and exits nonzero if any included machine is
+unreachable. `run.sh` quits Elgato's app to release the USB device and runs the
+controller. Ctrl-C stops it. Elgato's app remains closed.
 
 ## Session and terminal app
 
@@ -102,7 +104,7 @@ the next poll. Set `include_remote_machines` to `false` for local-only operation
 Local and remote tiles show their machine labels when saved machines are present.
 The status key shows the number of online machines and reports connection failures;
 the optional menu bar lists each machine and its error. Remote snapshots refresh
-in background workers, so an unreachable host does not delay local polling.
+in background threads, so an unreachable host does not delay local polling.
 Failed snapshots remove that machine's actionable tiles until it reconnects.
 
 Connections use normal OpenSSH config and keys, with `BatchMode=yes` and strict
@@ -111,7 +113,7 @@ restart remote servers. If a remote stays offline, verify this from a terminal:
 
 ```sh
 ssh -o BatchMode=yes herdr-remote 'echo connected'
-./.venv/bin/python herdr_backend.py --status
+./target/release/herdr-streamdeck status
 ```
 
 The SSH test should print `connected` without asking for credentials. A terminal
@@ -120,27 +122,24 @@ access from launchd; load the appropriate SSH agent/key first. The backend finds
 Herdr on the remote PATH or common direct, Homebrew, and Nix install paths.
 Remote DIFFS uses Git and `less` on that machine without copying helper files.
 
-Use `herdr_backend.py --local-only --status` to check only the local session.
-The status command exits nonzero if any included machine cannot be reached.
+Use `status --local-only` to check only the local session.
 
 ## Background services
 
-From this checkout:
+From this checkout, after `cargo build --release`:
 
 ```sh
-./.venv/bin/python install_services.py             # prepare plists only
-./.venv/bin/python install_services.py --install   # start deck + disarmed helper
-./.venv/bin/python install_services.py --install --menubar
+./target/release/herdr-streamdeck install             # prepare plists only
+./target/release/herdr-streamdeck install --install   # start deck + disarmed helper
+./target/release/herdr-streamdeck install --install --menubar
 ```
 
-The installer generates paths from its actual checkout location, updates
-`~/Library/LaunchAgents`, and starts the selected services. It retires the old
-Orca services and backs up their plists and previous arm files in
-`~/.config/herdr-streamdeck/migration-backup/`. Every installation starts
-auto-approval disarmed. The menu bar app is optional:
+The installer generates paths from the current checkout and binary, updates
+`~/Library/LaunchAgents`, and restarts the selected services. Every installation
+starts auto-approval disarmed. The menu bar app is optional:
 
 ```sh
-./.venv/bin/python herdr_menubar.py
+./target/release/herdr-streamdeck menubar
 ```
 
 Logs live at `~/Library/Logs/herdr-streamdeck.log`, `herdr-autoapprove.log`, and
@@ -175,33 +174,41 @@ is answered once. Failed input is not recorded as an approval. Herdr's CLI does
 not provide an atomic compare-and-send operation; the last state check and input
 are separate calls. A UI change between them remains possible.
 
-To disarm without the UI:
+To disarm without the UI, delete the arm file:
 
 ```sh
-./.venv/bin/python -c 'import herdr_streamdeck as deck; deck.disarm_autoapprove()'
+trash ~/.herdr-streamdeck-armed
 ```
 
 ## Migration notes
 
 The project moved from `~/orca/projects/orca-streamdeck` to
-`~/workspace/herdr-streamdeck`, preserving its Git history. Runtime commands now
-use Herdr exclusively. Orca remote discovery was replaced by Herdr's saved SSH
-machine catalog. Orca PR badges, pins, and the
-Orca-board worktree cleanup command were retired: Herdr's agent snapshot does
-not expose those Orca records. Workspaces and Git checkouts are never deleted
-by the controller.
+`~/workspace/herdr-streamdeck`, preserving its Git history. Runtime commands use
+Herdr exclusively. Orca remote discovery was replaced by Herdr's saved SSH
+machine catalog. Orca PR badges, pins, and the Orca-board worktree cleanup
+command were retired: Herdr's agent snapshot does not expose those Orca records.
+Workspaces and Git checkouts are never deleted by the controller.
+
+The Python implementation was replaced by this Rust binary in September 2026.
+Agent identities and arm files are byte-compatible: the Rust port hashes the
+same `json.dumps(sort_keys=True)` shape, so existing scoped windows stay valid.
+The Python installer retired the old Orca LaunchAgents; the Rust installer only
+manages the `com.taek.herdr-*` labels.
 
 ## Development
 
 ```sh
-./.venv/bin/python -m unittest -v test_herdr_streamdeck test_remote_machines
-./.venv/bin/python -m compileall -q herdr_backend.py herdr_streamdeck.py herdr_ui.py herdr_autoapprove.py herdr_menubar.py review_changes.py install_services.py
+cargo test
+cargo clippy --all-targets
+./target/release/herdr-streamdeck preview /tmp/keys.png
 ```
 
-`herdr_backend.py` owns CLI parsing and identity checks; `herdr_streamdeck.py`
-owns hardware events and approval controls; `herdr_ui.py` renders tiles.
-`review_changes.py` is the terminal diff viewer. Tests exercise real CLI-shaped
-fixtures, stale targets, session routing, approval gating, disconnect handling,
-key layouts, and Git review output without touching an agent or the USB device.
-Remote regressions mock SSH and cover machine identity collisions, argument
-quoting, partial outages, profile changes, action routing, and approval scope.
+`src/model.rs` holds configuration, identities, and tile construction;
+`src/backend.rs` runs Herdr locally or over SSH and polls the fleet;
+`src/approval.rs` recognizes Codex dialogs and owns the arm file;
+`src/controller.rs` maps deck keys to actions; `src/ui.rs` renders tiles;
+`src/menubar.rs` is the AppKit menu bar. Tests in `tests/port.rs` exercise real
+CLI-shaped fixtures through a fake command runner: identity collisions across
+machines, session routing, SSH argument quoting, approval gating, disconnect
+handling, key layouts, auto-approval scope, and Git review output, without
+touching an agent or the USB device.

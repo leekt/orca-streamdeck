@@ -2,28 +2,28 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>EnvironmentVariables</key>
-	<dict>
-		<key>PATH</key>
-		<string>/Users/taek/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-	</dict>
-	<key>KeepAlive</key>
-	<true/>
 	<key>Label</key>
 	<string>com.taek.herdr-streamdeck</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/taek/workspace/herdr-streamdeck/run.sh</string>
 	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>StandardErrorPath</key>
-	<string>/Users/taek/Library/Logs/herdr-streamdeck.log</string>
-	<key>StandardOutPath</key>
-	<string>/Users/taek/Library/Logs/herdr-streamdeck.log</string>
-	<key>ThrottleInterval</key>
-	<integer>30</integer>
 	<key>WorkingDirectory</key>
 	<string>/Users/taek/workspace/herdr-streamdeck</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/taek/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/taek/Library/Logs/herdr-streamdeck.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/taek/Library/Logs/herdr-streamdeck.log</string>
 </dict>
 </plist>

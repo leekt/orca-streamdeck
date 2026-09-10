@@ -1,3 +1,0 @@
-streamdeck
-pillow
-rumps
