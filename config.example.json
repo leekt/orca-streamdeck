@@ -1,0 +1,5 @@
+{
+  "session": "default",
+  "terminal_app": "Ghostty",
+  "include_remote_machines": true
+}
