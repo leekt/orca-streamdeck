@@ -26,7 +26,7 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSMenu", "NSMenuItem", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSEvent", "NSResponder"] }
-objc2-foundation = { version = "0.3", features = ["NSDate", "NSString", "NSRunLoop", "NSThread"] }
+objc2-foundation = { version = "0.3", features = ["NSDate", "NSString", "NSRunLoop", "NSThread", "NSTimer"] }
 
 [profile.release]
 lto = "thin"

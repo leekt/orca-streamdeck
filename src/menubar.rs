@@ -15,7 +15,7 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSStatusBar,
     NSVariableStatusItemLength,
 };
-use objc2_foundation::{NSDate, NSObject, NSRunLoop, NSString};
+use objc2_foundation::{NSObject, NSString, NSTimer};
 use std::cell::RefCell;
 
 enum Pick {
@@ -27,6 +27,7 @@ enum Pick {
 struct Ivars {
     picks: RefCell<Vec<Pick>>,
     chosen: RefCell<Vec<usize>>,
+    tick: RefCell<Option<Box<dyn FnMut()>>>,
 }
 
 define_class!(
@@ -36,7 +37,17 @@ define_class!(
     struct Handler;
     impl Handler {
         #[unsafe(method(pick:))]
-        fn pick(&self, sender: &NSMenuItem) { self.ivars().chosen.borrow_mut().push(sender.tag() as usize); }
+        fn pick(&self, sender: &NSMenuItem) {
+            self.ivars().chosen.borrow_mut().push(sender.tag() as usize);
+        }
+        #[unsafe(method(tick:))]
+        fn tick(&self, _timer: &NSTimer) {
+            if let Ok(mut tick) = self.ivars().tick.try_borrow_mut() {
+                if let Some(tick) = tick.as_mut() {
+                    tick();
+                }
+            }
+        }
     }
 );
 
@@ -209,7 +220,7 @@ pub fn run(backend: Backend) -> Result<()> {
         unsafe { msg_send![super(Handler::alloc(mtm).set_ivars(Ivars::default())), init] };
     let mut bar = Bar {
         mtm,
-        handler,
+        handler: handler.clone(),
         menu,
         status,
         signature: String::new(),
@@ -218,9 +229,9 @@ pub fn run(backend: Backend) -> Result<()> {
     let actions = Actions::start(backend.clone());
     let path = armed_path()?;
     let mut frame = Frame::default();
-    app.finishLaunching();
-    loop {
-        NSRunLoop::mainRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.25));
+    // AppKit only delivers status-item clicks from its own event loop, so the
+    // refresh runs from a timer inside `NSApplication::run` rather than a manual loop.
+    let tick = move || {
         while let Ok(next) = monitor.frames.try_recv() {
             frame = next;
         }
@@ -264,5 +275,18 @@ pub fn run(backend: Backend) -> Result<()> {
             bar.signature.clear();
         }
         bar.rebuild(&frame, arm.as_ref(), now);
-    }
+    };
+    *handler.ivars().tick.borrow_mut() = Some(Box::new(tick));
+    let target: &AnyObject = &handler;
+    let _timer = unsafe {
+        NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+            0.25,
+            target,
+            sel!(tick:),
+            None,
+            true,
+        )
+    };
+    app.run();
+    Ok(())
 }
