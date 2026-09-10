@@ -1,0 +1,14 @@
+{
+  "agents": [
+    {
+      "agent": "codex", "agent_status": "blocked", "pane_id": "w4:p2",
+      "terminal_id": "term_live", "workspace_id": "w4", "tab_id": "w4:t2",
+      "agent_session": {"agent": "codex", "kind": "id", "value": "conversation-1"},
+      "foreground_cwd": "/tmp/project", "terminal_title_stripped": "Fix login",
+      "state_change_seq": 7
+    }
+  ],
+  "panes": [{"pane_id": "w4:p1", "agent_status": "unknown"}],
+  "workspaces": [{"workspace_id": "w4", "label": "kernel"}],
+  "tabs": [{"tab_id": "w4:t2", "label": "Agent"}]
+}
