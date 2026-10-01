@@ -38,8 +38,10 @@ run over SSH on the agent's owning machine, using that machine's saved session.
 **AUTO** enables approval until turned off for that specific Codex conversation;
 tap again to disarm. Hold AUTO to cycle 30 minutes, one hour, forever, and off.
 The key shows `off`, the remaining time, or `forever`; `all` means a session-wide
-window also covers this agent. **INTR** sends Escape to Codex, or Ctrl-C to another working
-agent. Idle agents cannot be interrupted from the deck.
+window also covers this agent. Per-agent AUTO requires Herdr to report a
+conversation ID; session-wide AUTO also covers local Codex panes without one,
+including newly split panes. **INTR** sends Escape to Codex, or Ctrl-C to another
+working agent. Idle agents cannot be interrupted from the deck.
 **DIFFS** creates a `Changes` tab in the agent's Herdr workspace, showing staged
 and unstaged Git diffs plus untracked filenames in `less`. Press `q` to leave
 the viewer and close that tab when finished. **BACK** returns to the overview;
@@ -161,7 +163,9 @@ are explicitly supplied with `--only`.
 
 It requires all of the following before sending Enter:
 
-- A recognized Codex agent with a conversation identity and a live `blocked` state.
+- A recognized Codex agent with a live `blocked` state. Conversation-scoped
+  windows (including `--only`) additionally require a conversation identity;
+  session-wide local windows also cover panes without one.
 - A recognized approval dialog in the current detection screen, with the
   one-time Yes option visibly selected.
 - An unexpired window for the configured session and, when scoped, that exact

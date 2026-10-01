@@ -61,7 +61,7 @@ impl Arm {
     }
     pub fn covers(&self, item: &Item) -> bool {
         match &self.only {
-            Some(id) => id == &item.id,
+            Some(id) => item.can_auto() && id == &item.id,
             None => item.machine_id == "local",
         }
     }
@@ -203,9 +203,12 @@ pub fn poll(
     let ids: HashSet<_> = frame.agents.iter().map(|a| &a.id).collect();
     sent.retain(|id, _| ids.contains(id));
     for item in &frame.agents {
+        // Herdr may recognize Codex in a newly split pane before it has a
+        // conversation ID. A local session-wide window covers that pane;
+        // conversation-scoped windows still require the conversation identity.
         if item.state != State::Blocked
-            || !item.can_auto()
-            || (!only.is_empty() && !only.contains(&item.id))
+            || item.agent_type != "codex"
+            || (!only.is_empty() && (!item.can_auto() || !only.contains(&item.id)))
         {
             continue;
         }

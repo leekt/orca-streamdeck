@@ -32,6 +32,7 @@ fn remote() -> Source {
 struct Fake {
     log: Mutex<Vec<Vec<String>>>,
     agent: Mutex<Option<Value>>,
+    agents: Mutex<Vec<Value>>,
     tail: Mutex<String>,
     machines: Mutex<String>,
     remote_down: Mutex<bool>,
@@ -74,9 +75,27 @@ impl Runner for Fake {
         let result = if flat.contains("machine list") {
             return Ok(self.machines.lock().unwrap().clone());
         } else if flat.contains("api snapshot") {
-            json!({"snapshot": snapshot()})
+            let mut snapshot = snapshot();
+            let agents = self.agents.lock().unwrap();
+            if !agents.is_empty() {
+                snapshot["agents"] = json!(*agents);
+            }
+            json!({"snapshot": snapshot})
         } else if flat.contains("agent get") {
-            match self.agent.lock().unwrap().clone() {
+            let agents = self.agents.lock().unwrap();
+            let agent = if agents.is_empty() {
+                self.agent.lock().unwrap().clone()
+            } else {
+                let target = flat
+                    .split("agent get ")
+                    .nth(1)
+                    .and_then(|args| args.split_whitespace().next());
+                agents
+                    .iter()
+                    .find(|a| field(a, "pane_id") == target)
+                    .cloned()
+            };
+            match agent {
                 Some(agent) => json!({"agent": agent}),
                 None => bail!("agent not found"),
             }
@@ -462,6 +481,126 @@ fn auto_approval_answers_each_modal_once_and_respects_scope() {
         1,
         "non-codex agents are ignored"
     );
+}
+
+#[test]
+fn session_auto_approves_each_codex_pane_in_a_split_tab_without_conversation_ids() {
+    let fake = Fake::new();
+    let backend = backend(&fake, "default", false);
+    let mut focused = snapshot()["agents"][0].clone();
+    focused["agent"] = json!("claude");
+    focused["agent_session"]["agent"] = json!("claude");
+    focused["focused"] = json!(true);
+    let mut agents = vec![focused];
+    for n in [3, 4] {
+        let mut agent = snapshot()["agents"][0].clone();
+        agent["pane_id"] = json!(format!("w4:p{n}"));
+        agent["terminal_id"] = json!(format!("term_split_{n}"));
+        agent["focused"] = json!(false);
+        agent.as_object_mut().unwrap().remove("agent_session");
+        agents.push(agent);
+    }
+    *fake.agents.lock().unwrap() = agents;
+    let frame = Frame {
+        agents: backend.items().unwrap(),
+        ..Frame::default()
+    };
+    assert!(
+        frame
+            .agents
+            .iter()
+            .all(|a| a.tab_id == frame.agents[0].tab_id)
+    );
+    assert_ne!(frame.agents[1].id, frame.agents[2].id);
+    let (_dir, path) = arm_file();
+    Arm::write(&path, "default", 2, None, 0.0).unwrap();
+    let mut sent = Sent::new();
+    approval::poll(&backend, &frame, &path, &mut sent, false, &HashSet::new());
+    assert_eq!(fake.calls("send-keys w4:p3 enter").len(), 1);
+    assert_eq!(fake.calls("send-keys w4:p4 enter").len(), 1);
+    assert_eq!(fake.calls("send-keys").len(), 2);
+    for pane in ["w4:p3", "w4:p4"] {
+        assert_eq!(
+            fake.calls(&format!("agent read {pane} --source detection"))
+                .len(),
+            2
+        );
+    }
+    // Once the retry cooldown expires, each unchanged modal is still deduplicated.
+    for (_, _, at) in sent.values_mut() {
+        *at = 0;
+    }
+    approval::poll(&backend, &frame, &path, &mut sent, false, &HashSet::new());
+    assert_eq!(fake.calls("send-keys").len(), 2);
+}
+
+#[test]
+fn missing_conversation_ids_require_local_session_wide_auto() {
+    let fake = Fake::new();
+    let backend = backend(&fake, "default", false);
+    fake.agent.lock().unwrap().as_mut().unwrap()["agent_session"] = Value::Null;
+    let mut snapshot = snapshot();
+    snapshot["agents"][0] = fake.agent.lock().unwrap().clone().unwrap();
+    let local = build_items(&snapshot, &Source::local("default"))
+        .unwrap()
+        .remove(0);
+    let remote_item = build_items(&snapshot, &remote()).unwrap().remove(0);
+    let (_dir, path) = arm_file();
+    let frame = Frame {
+        agents: vec![local.clone(), remote_item.clone()],
+        ..Frame::default()
+    };
+    let none = HashSet::new();
+
+    // Disarmed, conversation-scoped, and --only windows cannot authorize these panes.
+    approval::poll(&backend, &frame, &path, &mut Sent::new(), false, &none);
+    for target in [&local, &remote_item] {
+        let arm = Arm::write(&path, "default", 2, Some(target.id.clone()), 0.0).unwrap();
+        assert!(!arm.covers(target));
+        approval::poll(&backend, &frame, &path, &mut Sent::new(), false, &none);
+        approval::poll(
+            &backend,
+            &frame,
+            &path,
+            &mut Sent::new(),
+            true,
+            &HashSet::from([target.id.clone()]),
+        );
+    }
+    assert!(fake.calls("send-keys").is_empty());
+
+    // --always is local-session-wide, just like the global AUTO switch.
+    approval::poll(&backend, &frame, &path, &mut Sent::new(), true, &none);
+    assert_eq!(fake.calls("send-keys w4:p2 enter").len(), 1);
+    assert!(
+        fake.calls("send-keys")
+            .iter()
+            .all(|c| c[0] != "/usr/bin/ssh")
+    );
+
+    // The relaxed metadata requirement does not relax dialog or selection checks.
+    Arm::write(&path, "default", 2, None, 0.0).unwrap();
+    for tail in [
+        QUESTION.to_owned(),
+        PROMPT.replace("Yes, proceed (y)", "Yes, and don't ask again"),
+    ] {
+        *fake.tail.lock().unwrap() = tail;
+        approval::poll(&backend, &frame, &path, &mut Sent::new(), false, &none);
+    }
+    assert_eq!(fake.calls("send-keys").len(), 1);
+
+    // Live terminal/conversation changes invalidate the snapshot before input.
+    *fake.tail.lock().unwrap() = PROMPT.into();
+    for (name, value) in [
+        ("terminal_id", json!("term_replacement")),
+        ("agent_session", json!({"value": "new-conversation"})),
+    ] {
+        let mut changed = snapshot["agents"][0].clone();
+        changed[name] = value;
+        *fake.agent.lock().unwrap() = Some(changed);
+        approval::poll(&backend, &frame, &path, &mut Sent::new(), false, &none);
+    }
+    assert_eq!(fake.calls("send-keys").len(), 1);
 }
 
 #[test]

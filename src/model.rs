@@ -252,6 +252,8 @@ impl Item {
             session: self.session.clone(),
         }
     }
+    /// Whether AUTO can be armed for this specific conversation.
+    /// Session-wide local AUTO also covers Codex panes without a conversation ID.
     pub fn can_auto(&self) -> bool {
         self.agent_type == "codex" && self.agent_session.as_ref().is_some_and(|s| !s.is_null())
     }
