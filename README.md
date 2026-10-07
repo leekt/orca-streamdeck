@@ -110,7 +110,13 @@ in background threads, so an unreachable host does not delay local polling.
 Failed snapshots remove that machine's actionable tiles until it reconnects.
 
 Connections use normal OpenSSH config and keys, with `BatchMode=yes` and strict
-host-key verification. The controller does not answer SSH prompts or install or
+host-key verification. The deck, menu bar, and approval helper share persistent
+SSH connections to each target, so polling does not repeatedly authenticate with
+your SSH agent (including 1Password). Control sockets live in an owner-only
+`/tmp/hsd-ssh-<uid>` directory, with separate sockets for different aliases and
+resolved destinations. Connections close after 60 seconds without a command;
+OpenSSH reconnects when needed. No changes to `~/.ssh/config` are required.
+The controller does not answer SSH prompts or install or
 restart remote servers. If a remote stays offline, verify this from a terminal:
 
 ```sh

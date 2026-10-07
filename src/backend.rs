@@ -38,6 +38,9 @@ pub trait Runner: Send + Sync {
 pub struct SystemRunner;
 impl Runner for SystemRunner {
     fn run(&self, spec: Spec) -> Result<String> {
+        if spec.program == "/usr/bin/ssh" {
+            process::prepare_ssh_control_directory()?;
+        }
         process::text(spec.command())
     }
 }
@@ -78,11 +81,17 @@ impl Backend {
                 "ServerAliveInterval=3",
                 "-o",
                 "ServerAliveCountMax=1",
-                "--",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPersist=60",
+                "-o",
             ]
             .iter()
             .map(|s| s.to_string())
             .chain([
+                format!("ControlPath={}", process::ssh_control_path(target)),
+                "--".into(),
                 target.clone(),
                 process::shell_join(&["/bin/sh".into(), "-c".into(), script.into()]),
             ])

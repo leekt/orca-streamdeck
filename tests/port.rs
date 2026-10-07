@@ -267,6 +267,43 @@ fn cli_routes_sessions_and_wraps_remote_calls_in_batch_ssh() {
 }
 
 #[test]
+fn independent_services_share_ssh_connections_but_not_host_aliases() {
+    let control_path = |spec: &Spec| {
+        spec.args
+            .iter()
+            .find(|a| a.starts_with("ControlPath="))
+            .unwrap()
+            .clone()
+    };
+    let poll = backend(&Fake::new(), "default", true)
+        .for_source(remote())
+        .spec(&["api", "snapshot"])
+        .unwrap();
+    let mut same_host = remote();
+    same_host.session = "another-session".into();
+    let action = backend(&Fake::new(), "work", true)
+        .for_source(same_host)
+        .spec(&["agent", "get", "w4:p2"])
+        .unwrap();
+    assert_eq!(control_path(&poll), control_path(&action));
+    assert!(poll.args.contains(&"ControlMaster=auto".into()));
+    assert!(poll.args.contains(&"ControlPersist=60".into()));
+    assert!(control_path(&poll).ends_with("-%C"));
+
+    let mut other_host = remote();
+    other_host.target = Some("other-alias".into());
+    let other = backend(&Fake::new(), "default", true)
+        .for_source(other_host)
+        .spec(&["api", "snapshot"])
+        .unwrap();
+    assert_ne!(control_path(&poll), control_path(&other));
+    let local = backend(&Fake::new(), "default", false)
+        .spec(&["api", "snapshot"])
+        .unwrap();
+    assert!(!local.args.iter().any(|a| a.starts_with("Control")));
+}
+
+#[test]
 fn errors_and_malformed_json_fail_closed() {
     struct Broken;
     impl Runner for Broken {
